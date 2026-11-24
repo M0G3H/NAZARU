@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/nazaru-banner.png" alt="NAZARU — The Digital Guardian" width="100%">
+  <img src="./nazaru-banner.png" alt="NAZARU — The Digital Guardian" width="100%">
 </p>
 
 # 🛡️ NAZARU
