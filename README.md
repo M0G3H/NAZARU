@@ -150,5 +150,5 @@ Running with elevated privileges can improve visibility into protected files, sy
 
 
 <p align="center">
-  **🛡️ NAZARU — See the Weakness. Strengthen the System.**
+  <strong>🛡️ NAZARU — See the Weakness. Strengthen the System.</strong>
 </p>
