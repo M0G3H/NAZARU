@@ -3,8 +3,6 @@
 </p>
 
 
-
----
 ## Origin of the Name – NAZARU
 The name **NAZARU** is inspired by the ancient Akkadian words Naṣāru (to guard, protect, and preserve) and Nāṣiru (guardian or protector).
 
