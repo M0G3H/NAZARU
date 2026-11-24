@@ -1,0 +1,1555 @@
+#!/usr/bin/env bash
+# Usage: bash Nazaru [report-file]
+# Optional environment variable: REPORT_FILE=/path/to/report.txt
+# Missing tools/permissions are reported as UNKNOWN
+
+set -o pipefail
+umask 077
+
+REPORT_FILE="${1:-${REPORT_FILE:-./server_audit_report.txt}}"
+REPORT_DIR="$(dirname -- "$REPORT_FILE")"
+if ! mkdir -p -- "$REPORT_DIR" 2>/dev/null; then
+    printf 'ERROR: cannot create report directory: %s\n' "$REPORT_DIR" >&2
+    exit 2
+fi
+if ! touch -- "$REPORT_FILE" 2>/dev/null; then
+    printf 'ERROR: cannot write report file: %s\n' "$REPORT_FILE" >&2
+    exit 2
+fi
+
+LOCK_MODE="none"
+LOCK_DIR="${REPORT_FILE}.lockdir"
+if command -v flock >/dev/null 2>&1; then
+    if ! { exec 9>>"${REPORT_FILE}.lock"; } 2>/dev/null; then
+        printf 'ERROR: cannot open lock file: %s\n' "${REPORT_FILE}.lock" >&2
+        exit 2
+    fi
+    if ! flock -n 9; then
+        printf 'Another audit is already writing to %s\n' "$REPORT_FILE" >&2
+        exit 1
+    fi
+    LOCK_MODE="flock"
+else
+    if ! mkdir -- "$LOCK_DIR" 2>/dev/null; then
+        printf 'Another audit may be running (lock directory exists): %s\n' "$LOCK_DIR" >&2
+        exit 1
+    fi
+    LOCK_MODE="mkdir"
+    trap 'rmdir -- "$LOCK_DIR" 2>/dev/null || true' EXIT
+fi
+
+show_banner() {
+    printf '\033[36m'
+    cat <<'EOF'
+███╗   ██╗  █████╗  ███████╗  █████╗  ██████╗  ██╗   ██╗
+████╗  ██║ ██╔══██╗ ╚══███╔╝ ██╔══██╗ ██╔══██╗ ██║   ██║
+██╔██╗ ██║ ███████║   ███╔╝  ███████║ ██████╔╝ ██║   ██║
+██║╚██╗██║ ██╔══██║  ███╔╝   ██╔══██║ ██╔══██╗ ██║   ██║
+██║ ╚████║ ██║  ██║ ███████╗ ██║  ██║ ██║  ██║ ╚██████╔╝
+╚═╝  ╚═══╝ ╚═╝  ╚═╝ ╚══════╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝  ╚═════╝
+EOF
+    printf '\033[0m\n'
+}
+
+log_line() {
+    # Non-result output is mirrored unchanged to terminal and report.
+    printf '%s
+' "$1" | tee -a "$REPORT_FILE"
+}
+
+log_result() {
+    local line="$1" color="$2"
+    # Keep the report file plain text; apply ANSI color only in the terminal.
+    if ! printf '%s
+' "$line" >> "$REPORT_FILE"; then
+        printf 'ERROR: cannot append to report file: %s
+' "$REPORT_FILE" >&2
+        exit 2
+    fi
+    printf '%b%s%b
+' "$color" "$line" '[0m'
+}
+
+result() {
+    # Every test returns exactly: STATUS|one-line detail
+    printf '%s|%s\n' "$1" "$2"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+is_active() {
+    local unit="$1"
+    have systemctl && systemctl is-active --quiet "$unit" 2>/dev/null
+}
+
+sshd_value() {
+    local key="$1" output value
+    if have sshd; then
+        output="$(sshd -T 2>/dev/null)"
+        value="$(printf '%s\n' "$output" | awk -v k="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')" 'tolower($1)==k {print tolower($2); exit}')"
+        if [[ -n "$value" ]]; then
+            printf '%s' "$value"
+            return 0
+        fi
+    fi
+    if [[ -r /etc/ssh/sshd_config ]]; then
+        # Fallback only: does not fully resolve Include/Match blocks.
+        awk -v k="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')" '
+            /^[[:space:]]*#/ {next}
+            tolower($1)==k {v=tolower($2)}
+            END {if (v!="") print v}
+        ' /etc/ssh/sshd_config 2>/dev/null
+        return 0
+    fi
+    return 1
+}
+
+count_matching_lines() {
+    awk 'NF {n++} END {print n+0}'
+}
+
+# ---------- Test functions ----------
+
+check_ssh_root_login() {
+    local v
+    v="$(sshd_value permitrootlogin)" || { result UNKNOWN 'sshd configuration unavailable'; return; }
+    if [[ "$v" == no ]]; then result PASS 'effective PermitRootLogin=no'
+    elif [[ -z "$v" ]]; then result UNKNOWN 'PermitRootLogin could not be determined'
+    else result FAIL "effective PermitRootLogin=$v; set to no if policy requires disabling SSH root login"; fi
+}
+
+check_ssh_password_auth() {
+    local v
+    v="$(sshd_value passwordauthentication)" || { result UNKNOWN 'sshd configuration unavailable'; return; }
+    if [[ "$v" == no ]]; then result PASS 'effective PasswordAuthentication=no'
+    elif [[ -z "$v" ]]; then result UNKNOWN 'PasswordAuthentication could not be determined'
+    else result WARN "effective PasswordAuthentication=$v; prefer key-based or centrally managed MFA-backed access where appropriate"; fi
+}
+
+check_root_account() {
+    local line state
+
+    if ! have passwd; then
+        result UNKNOWN 'passwd command not available'
+        return
+    fi
+
+    line="$(passwd -S root 2>/dev/null)" || {
+        result UNKNOWN 'cannot read root account status; try running with sufficient privileges'
+        return
+    }
+
+    state="$(printf '%s\n' "$line" | awk '{print $2}')"
+
+    case "$state" in
+        L|LK)
+            result PASS 'root password is locked'
+            ;;
+        P)
+            result INFO 'root has a password set; this alone does not indicate unauthorized root access'
+            ;;
+        NP)
+            result INFO 'root has no password set; verify account accessibility and recovery policy'
+            ;;
+        *)
+            result UNKNOWN "unrecognized root account status: ${state:-empty}"
+            ;;
+    esac
+}
+
+check_uid0_accounts() {
+    local count
+    [[ -r /etc/passwd ]] || { result UNKNOWN '/etc/passwd is not readable'; return; }
+    count="$(awk -F: '$3==0 {n++} END {print n+0}' /etc/passwd 2>/dev/null)"
+    if [[ "$count" -le 1 ]]; then result PASS 'only the standard UID 0 account was found'
+    else result FAIL "$count accounts have UID 0; review for unauthorized superuser accounts"; fi
+}
+
+check_empty_passwords() {
+    local count
+    [[ -r /etc/shadow ]] || { result UNKNOWN '/etc/shadow is not readable; run as root to perform this check'; return; }
+    count="$(awk -F: '($2==""){n++} END {print n+0}' /etc/shadow 2>/dev/null)"
+    if [[ "$count" -eq 0 ]]; then result PASS 'no empty password fields found'
+    else result FAIL "$count account(s) have an empty password field; account names and hashes were not recorded"; fi
+}
+
+check_sudo_nopasswd() {
+    local files=(/etc/sudoers)
+    local count=0 f n
+    [[ -d /etc/sudoers.d ]] && files+=(/etc/sudoers.d/*)
+    for f in "${files[@]}"; do
+        [[ -f "$f" && -r "$f" ]] || continue
+        n="$(grep -Ehv '^[[:space:]]*#|^[[:space:]]*$' "$f" 2>/dev/null | grep -Eo 'NOPASSWD:' 2>/dev/null | wc -l)"
+        count=$((count + n))
+    done
+    if [[ ! -r /etc/sudoers ]]; then result UNKNOWN 'sudoers files are not readable';
+    elif [[ "$count" -eq 0 ]]; then result PASS 'no active NOPASSWD directives detected';
+    else result WARN "$count active NOPASSWD directive(s) detected; validate each exception against policy"; fi
+}
+
+check_password_max_days() {
+    local days
+    [[ -r /etc/login.defs ]] || { result UNKNOWN '/etc/login.defs is not readable'; return; }
+    days="$(awk '$1=="PASS_MAX_DAYS" && $1 !~ /^#/ {v=$2} END {print v}' /etc/login.defs 2>/dev/null)"
+    if [[ ! "$days" =~ ^[0-9]+$ ]]; then result UNKNOWN 'PASS_MAX_DAYS is not configured as an integer';
+    elif (( days <= 0 )); then result WARN "PASS_MAX_DAYS=$days; review unlimited/invalid aging policy";
+    elif (( days <= 90 )); then result INFO "PASS_MAX_DAYS=$days in login.defs; this mainly affects newly created accounts and does not prove existing accounts comply";
+    else result WARN "PASS_MAX_DAYS=$days; value exceeds the script's 90-day review threshold (set threshold according to policy)"; fi
+}
+
+check_pam_lockout() {
+    local count
+    [[ -d /etc/pam.d && -r /etc/pam.d ]] || { result UNKNOWN '/etc/pam.d is unavailable'; return; }
+    count="$(grep -RihE '^[[:space:]]*auth[[:space:]].*pam_(faillock|tally2)\.so' /etc/pam.d 2>/dev/null | count_matching_lines)"
+    if [[ "$count" -gt 0 ]]; then result PASS "PAM account lockout module reference(s) detected: $count; validate thresholds and PAM stack order";
+    else result WARN 'no pam_faillock/pam_tally2 auth rule detected; verify centrally managed authentication separately'; fi
+}
+
+check_mfa_config() {
+    local pam_count ssh_methods
+
+    pam_count="$(
+        grep -RihE '^[[:space:]]*auth[[:space:]].*pam_(google_authenticator|oath|yubico|u2f|duo)' \
+            /etc/pam.d 2>/dev/null |
+        count_matching_lines
+    )"
+
+    ssh_methods="$(sshd_value authenticationmethods 2>/dev/null)"
+
+    if (( pam_count > 0 )) || [[ "$ssh_methods" == *+* ]]; then
+        result INFO "possible MFA indicators found (active PAM references=$pam_count, SSH AuthenticationMethods=${ssh_methods:-not-set}); enforcement must be verified manually"
+    else
+        result UNKNOWN 'no active local MFA indicators detected; centrally managed MFA may still be enabled'
+    fi
+}
+
+check_ssh_access_restrictions() {
+    local allow_users allow_groups listen
+    allow_users="$(sshd_value allowusers 2>/dev/null)"
+    allow_groups="$(sshd_value allowgroups 2>/dev/null)"
+    listen="$(sshd_value listenaddress 2>/dev/null)"
+    if [[ -n "$allow_users" || -n "$allow_groups" ]]; then
+        result PASS 'effective AllowUsers/AllowGroups restriction detected; validate intended administrators'
+    elif [[ -n "$listen" && "$listen" != 0.0.0.0:* && "$listen" != '::'* ]]; then
+        result INFO 'SSH appears bound to a specific address; verify network/firewall source restrictions separately'
+    else
+        result WARN 'no effective AllowUsers/AllowGroups restriction detected; firewall/VPN restrictions are not inferred here'
+    fi
+}
+
+check_listening_sockets() {
+    local output count
+    if have ss; then
+        output="$(ss -H -lnt 2>/dev/null)" || { result UNKNOWN 'ss failed; try with root for complete socket visibility'; return; }
+        count="$(printf '%s\n' "$output" | count_matching_lines)"
+        result INFO "$count TCP listening socket(s) detected; inspect with: ss -lntup (process names may require root)"
+    elif have netstat; then
+        output="$(netstat -lnt 2>/dev/null)" || { result UNKNOWN 'netstat failed'; return; }
+        count="$(printf '%s\n' "$output" | awk 'NR>2 && NF {n++} END {print n+0}')"
+        result INFO "$count TCP listening socket(s) detected; install iproute2 for ss if a fuller view is needed"
+    else
+        result UNKNOWN 'neither ss nor netstat is installed; ss is provided by iproute2'
+    fi
+}
+
+check_telnet_service() {
+    local active=0 installed=0
+    is_active telnet.socket && active=1
+    is_active telnet.service && active=1
+    have in.telnetd && installed=1
+    if (( active )); then result FAIL 'Telnet socket/service is active; disable and remove if not explicitly required';
+    elif (( installed )); then result WARN 'Telnet daemon binary detected but no active unit confirmed';
+    else result PASS 'no common Telnet daemon/unit detected'; fi
+}
+
+check_ftp_service() {
+    local active=0 installed=0 unit
+    for unit in vsftpd.service proftpd.service pure-ftpd.service; do is_active "$unit" && active=1; done
+    for unit in vsftpd proftpd pure-ftpd ftpd; do have "$unit" && installed=1; done
+    if (( active )); then result FAIL 'an FTP server service is active; prefer SFTP/SSH or a specifically approved secure alternative';
+    elif (( installed )); then result WARN 'FTP server binary detected but no active unit confirmed';
+    else result PASS 'no common FTP server binary/unit detected'; fi
+}
+
+check_samba_smb() {
+    local active=0 installed=0 minproto
+    is_active smbd.service && active=1
+    have smbd && installed=1
+    if (( !active && !installed )); then result PASS 'Samba server not detected'; return; fi
+    if (( !active )); then result INFO 'Samba binary is installed but smbd.service is not active'; return; fi
+    if ! have testparm; then result UNKNOWN 'Samba is active but testparm is missing; install samba-common-tools (RHEL/Fedora) or samba-common-bin (Debian/Ubuntu)'; return; fi
+    minproto="$(testparm -s --parameter-name='server min protocol' 2>/dev/null | tail -n 1 | tr '[:lower:]' '[:upper:]')"
+    case "$minproto" in
+        SMB2|SMB2_02|SMB2_10|SMB3|SMB3_00|SMB3_02|SMB3_11) result PASS "Samba active; server min protocol=$minproto" ;;
+        NT1|LANMAN1|LANMAN2) result FAIL "Samba active with legacy minimum protocol=$minproto; disable SMB1/NT1" ;;
+        *) result UNKNOWN 'Samba active but minimum protocol could not be determined';;
+    esac
+}
+
+check_snmpv3() {
+    local active=0 installed=0 community=0 users=0 f
+
+    is_active snmpd.service && active=1
+
+    if have pgrep && pgrep -x snmpd >/dev/null 2>&1; then
+        active=1
+    fi
+
+    have snmpd && installed=1
+
+    if (( !active )); then
+        if (( installed )); then
+            result INFO 'SNMP daemon is installed but no running daemon was detected; configuration was not treated as exposed'
+        else
+            result PASS 'SNMP daemon not detected as installed/active'
+        fi
+        return
+    fi
+
+    for f in /etc/snmp/snmpd.conf /etc/snmp/snmpd.local.conf; do
+        [[ -r "$f" ]] || continue
+
+        grep -Eiq '^[[:space:]]*(rocommunity|rwcommunity|com2sec)[[:space:]]' "$f" && community=1
+        grep -Eiq '^[[:space:]]*(rouser|rwuser)[[:space:]]' "$f" && users=1
+    done
+
+    if (( community )); then
+        result WARN 'SNMP community-based configuration detected in an active SNMP daemon; verify effective configuration and migrate to SNMPv3 authPriv where required'
+    elif (( users )); then
+        result INFO 'SNMPv3 user directive detected; confirm authPriv, strong secrets and source restrictions'
+    else
+        result UNKNOWN 'SNMP daemon is running but security mode could not be determined from standard configuration paths'
+    fi
+}
+
+check_firewall() {
+    local state rules
+    if have ufw; then
+        state="$(ufw status 2>/dev/null | awk -F: 'tolower($1) ~ /^status/ {gsub(/^[[:space:]]+/,"",$2); print tolower($2); exit}')"
+        [[ "$state" == active ]] && { result INFO 'UFW reports active'; return; }
+    fi
+    if have firewall-cmd; then
+        state="$(firewall-cmd --state 2>/dev/null)"
+        [[ "$state" == running ]] && { result INFO 'firewalld reports running; validate zone and service rules'; return; }
+    fi
+    if have nft; then
+        rules="$(nft list ruleset 2>/dev/null)"
+        if [[ -n "$rules" ]]; then result INFO 'nftables ruleset exists; default policies and interface coverage require manual review'; return; fi
+    fi
+    if have iptables; then
+        rules="$(iptables -S 2>/dev/null)"
+        if [[ -n "$rules" ]]; then
+            if printf '%s\n' "$rules" | grep -Eq '^-P INPUT (DROP|REJECT)|^-P FORWARD (DROP|REJECT)'; then
+                result INFO 'iptables has a DROP/REJECT default policy on INPUT/FORWARD'; return
+            fi
+            result WARN 'iptables rules exist but a restrictive default policy was not confirmed'; return
+        fi
+    fi
+    result UNKNOWN 'no active host firewall could be confirmed; permissions may be insufficient or no firewall frontend is installed'
+}
+
+check_update_reboot_flag() {
+    if [[ -e /var/run/reboot-required ]]; then result WARN 'system indicates a reboot is required; review pending package/kernel updates';
+    else result INFO 'no Debian-style reboot-required marker found; this does not prove the OS is fully patched'; fi
+}
+
+check_secure_boot() {
+    local output
+    [[ -d /sys/firmware/efi ]] || { result INFO 'system did not boot in UEFI mode; Secure Boot status is not applicable/detectable here'; return; }
+    if ! have mokutil; then result UNKNOWN 'mokutil missing; install mokutil to inspect Secure Boot state'; return; fi
+    output="$(mokutil --sb-state 2>&1)" || { result UNKNOWN 'mokutil could not read Secure Boot state'; return; }
+    if printf '%s' "$output" | grep -qi 'SecureBoot enabled'; then result PASS 'Secure Boot enabled';
+    elif printf '%s' "$output" | grep -qi 'SecureBoot disabled'; then result WARN 'Secure Boot disabled';
+    else result UNKNOWN 'mokutil returned an unrecognized Secure Boot state'; fi
+}
+
+check_mac_framework() {
+    local state output enforce_count
+
+    if have getenforce; then
+        state="$(getenforce 2>/dev/null)"
+        case "$state" in
+            Enforcing)
+                result PASS 'SELinux is Enforcing'
+                return
+                ;;
+            Permissive)
+                result WARN 'SELinux is Permissive, not Enforcing'
+                return
+                ;;
+            Disabled)
+                ;;
+        esac
+    fi
+
+    if have aa-status; then
+        output="$(aa-status 2>/dev/null)"
+
+        if printf '%s\n' "$output" | grep -Eqi 'apparmor module is loaded'; then
+            enforce_count="$(printf '%s\n' "$output" |
+                awk '/profiles are in enforce mode/ {
+                    for (i=1; i<=NF; i++)
+                        if ($i ~ /^[0-9]+$/) {print $i; exit}
+                }')"
+
+            if [[ "$enforce_count" =~ ^[0-9]+$ ]] && (( enforce_count > 0 )); then
+                result PASS "AppArmor has $enforce_count enforced profile(s)"
+            elif [[ "$enforce_count" == "0" ]]; then
+                result WARN 'AppArmor is loaded but has zero enforced profiles'
+            else
+                result UNKNOWN 'AppArmor is loaded but enforced profile count could not be determined'
+            fi
+        else
+            result WARN 'AppArmor enforcement could not be confirmed'
+        fi
+    else
+        result WARN 'neither active SELinux enforcement nor AppArmor enforcement could be confirmed'
+    fi
+}
+
+check_automatic_updates() {
+    local active=0 installed=0
+    is_active apt-daily-upgrade.timer && active=1
+    is_active dnf-automatic.timer && active=1
+    is_active dnf-automatic-install.timer && active=1
+    is_active yum-cron.service && active=1
+    have unattended-upgrade && installed=1
+    have dnf-automatic && installed=1
+    if (( active )); then result PASS 'an automatic update timer/service is active';
+    elif (( installed )); then result WARN 'automatic update tool detected but no common active timer/service confirmed';
+    else result WARN 'no common automatic security update mechanism detected'; fi
+}
+
+check_grub_password() {
+    local count
+    if [[ ! -d /etc/grub.d && ! -d /boot/grub2 ]]; then result UNKNOWN 'standard GRUB configuration paths not found'; return; fi
+    count="$(grep -RihE '^[[:space:]]*password(_pbkdf2)?[[:space:]]' /etc/grub.d /etc/default/grub /boot/grub2/user.cfg 2>/dev/null | count_matching_lines)"
+    if [[ "$count" -gt 0 ]]; then result INFO 'GRUB password directive detected; password/hash content intentionally not recorded';
+    else result WARN 'no GRUB password directive detected; assess physical/console access and recovery requirements'; fi
+}
+
+check_critical_file_permissions() {
+    local bad=0 f mode
+    for f in /etc/passwd /etc/group /etc/shadow /etc/gshadow; do
+        if [[ ! -e "$f" || ! -r "$f" ]]; then result UNKNOWN "cannot inspect $f; run with sufficient privileges"; return; fi
+        mode="$(stat -c '%a' "$f" 2>/dev/null)" || { result UNKNOWN "stat failed for $f"; return; }
+        case "$f:$mode" in
+            /etc/passwd:644|/etc/group:644|/etc/shadow:600|/etc/shadow:640|/etc/shadow:0|/etc/gshadow:600|/etc/gshadow:640|/etc/gshadow:0) ;;
+            *) bad=$((bad + 1));;
+        esac
+    done
+    if (( bad == 0 )); then result PASS 'passwd/group are 0644 and shadow/gshadow are 0600, 0640 or 000';
+    else result WARN "$bad critical account file(s) have non-standard permissions; review distribution-specific ownership/mode"; fi
+}
+
+check_suid_sgid() {
+    local output count
+    output="$(find /usr /bin /sbin /usr/local /opt -xdev -type f \( -perm -4000 -o -perm -2000 \) -print 2>/dev/null)"
+    count="$(printf '%s\n' "$output" | count_matching_lines)"
+    if [[ -z "$output" ]]; then result INFO 'no SUID/SGID files found in scanned paths';
+    else result INFO "$count SUID/SGID file(s) found in common binary paths; review against package/vendor baseline (not automatically a failure)"; fi
+}
+
+check_world_writable_files() {
+    local output count
+    output="$(find /etc /usr/local /opt /var -xdev -type f -perm -0002 -print 2>/dev/null)"
+    count="$(printf '%s\n' "$output" | count_matching_lines)"
+    if [[ -z "$output" ]]; then result PASS 'no world-writable regular files found in scanned paths';
+    else result WARN "$count world-writable file(s) found in /etc,/usr/local,/opt,/var; review ownership and purpose"; fi
+}
+
+check_cron_access() {
+    if [[ -f /etc/cron.allow ]]; then result INFO '/etc/cron.allow exists; verify its contents and ownership manually';
+    elif [[ -f /etc/cron.deny ]]; then result WARN 'only /etc/cron.deny exists; cron may be available to all users except denied users';
+    else result WARN 'neither /etc/cron.allow nor /etc/cron.deny exists; review local cron access policy'; fi
+}
+
+check_linux_capabilities() {
+    local output count
+    if ! have getcap; then result UNKNOWN 'getcap missing; install libcap2-bin (Debian/Ubuntu) or libcap (RHEL/Fedora)'; return; fi
+    output="$(getcap -r /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin 2>/dev/null)"
+    count="$(printf '%s\n' "$output" | count_matching_lines)"
+    result INFO "$count file(s) with Linux capabilities detected in common binary paths; review each capability against operational need"
+}
+
+check_admin_groups() {
+    local sudo_count=0 wheel_count=0 line
+    if have getent; then
+        line="$(getent group sudo 2>/dev/null | awk -F: '{print $4}')"
+        [[ -n "$line" ]] && sudo_count="$(printf '%s' "$line" | awk -F, '{print NF}')"
+        line="$(getent group wheel 2>/dev/null | awk -F: '{print $4}')"
+        [[ -n "$line" ]] && wheel_count="$(printf '%s' "$line" | awk -F, '{print NF}')"
+        result INFO "sudo group member count=${sudo_count}; wheel group member count=${wheel_count}; compare with approved administrator list"
+    else
+        result UNKNOWN 'getent is not available to inspect local admin groups';
+    fi
+}
+
+check_user_account_inventory() {
+    local count
+    [[ -r /etc/passwd ]] || { result UNKNOWN '/etc/passwd is not readable'; return; }
+    count="$(awk -F: '$3>=1000 && $3!=65534 && $7 !~ /(nologin|false)$/ {n++} END {print n+0}' /etc/passwd 2>/dev/null)"
+    result INFO "$count non-system login-capable account(s) with UID >= 1000; validate against approved account inventory"
+}
+
+check_authorized_keys() {
+    local f mode count=0 risky=0
+    for f in /root/authorized_keys /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+        [[ -f "$f" ]] || continue
+        count=$((count + 1))
+        mode="$(stat -c '%a' "$f" 2>/dev/null)"
+        if [[ "$mode" =~ ^[0-7]+$ ]] && (( (8#$mode & 0022) != 0 )); then risky=$((risky + 1)); fi
+    done
+    if (( risky > 0 )); then result WARN "$count authorized_keys file(s) found; $risky have group/world write bits; key contents were not read or logged";
+    else result INFO "$count authorized_keys file(s) found under /root and /home; contents were not read or logged; compare keys with approved inventory"; fi
+}
+
+check_systemd_enabled_services() {
+    local output count
+    if ! have systemctl; then result UNKNOWN 'systemctl unavailable; host may not use systemd'; return; fi
+    output="$(systemctl list-unit-files --type=service --state=enabled --no-legend 2>/dev/null)" || { result UNKNOWN 'cannot enumerate enabled systemd services'; return; }
+    count="$(printf '%s\n' "$output" | count_matching_lines)"
+    result INFO "$count enabled systemd service unit(s); compare with the approved server role baseline"
+}
+
+check_cron_persistence_inventory() {
+    local count
+    count="$(find /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly /var/spool/cron /var/spool/cron/crontabs -type f -print 2>/dev/null | count_matching_lines)"
+    result INFO "$count cron file(s) found in common system/user cron paths; inspect for unapproved scheduled tasks"
+}
+
+check_legacy_startup() {
+    local enabled="unknown" active=0
+
+    if [[ ! -e /etc/rc.local ]]; then
+        result PASS 'no /etc/rc.local startup script found'
+        return
+    fi
+
+    if [[ ! -x /etc/rc.local ]]; then
+        result INFO '/etc/rc.local exists but is not executable'
+        return
+    fi
+
+    is_active rc-local.service && active=1
+
+    if have systemctl; then
+        enabled="$(systemctl is-enabled rc-local.service 2>/dev/null || true)"
+    fi
+
+    if (( active )) || [[ "$enabled" == enabled ]]; then
+        result WARN "/etc/rc.local is executable and rc-local.service is active/enabled (enabled=$enabled, active=$active); review its commands"
+    else
+        result INFO "/etc/rc.local is executable but rc-local.service is not confirmed active or enabled (enabled=$enabled, active=$active)"
+    fi
+}
+
+check_file_integrity_monitoring() {
+    local found=0
+    { have aide && found=1; }
+    { have tripwire && found=1; }
+    [[ -f /etc/aide/aide.conf || -f /etc/aide.conf || -f /etc/tripwire/tw.cfg ]] && found=1
+    if (( found )); then result INFO 'AIDE/Tripwire binary or configuration detected; verify database initialization and scheduled checks';
+    else result WARN 'no common AIDE/Tripwire file-integrity monitoring installation detected'; fi
+}
+
+check_authentication_logs() {
+    local journal=0 files=0
+    is_active systemd-journald.service && journal=1
+    [[ -s /var/log/auth.log || -s /var/log/secure ]] && files=1
+    if (( journal || files )); then result PASS "authentication log source detected (journald=$journal, auth-log-file=$files); retention and access controls need separate review";
+    else result WARN 'no active journald or standard auth.log/secure file detected'; fi
+}
+
+check_edr_presence() {
+    local matches
+    matches="$(ps -eo comm= 2>/dev/null | grep -Eic '(^|/)(wazuh-agentd|osqueryd|falcon-sensor|sentinel-agent|qualys-cloud-agent|ds_agent|mdatp|elastic-agent|filebeat)$')"
+    if [[ "$matches" -gt 0 ]]; then result INFO "$matches common endpoint-security/telemetry process(es) detected; verify agent health and central connectivity";
+    else result WARN 'no common EDR/host security agent process detected; product names vary and absence is not proof of no protection'; fi
+}
+
+check_remote_log_forwarding() {
+    local count=0 f
+
+    for f in /etc/rsyslog.conf /etc/rsyslog.d/*; do
+        [[ -f "$f" && -r "$f" ]] || continue
+
+        count=$((count + $(
+            awk '
+                /^[[:space:]]*#/ {next}
+                /^[[:space:]]*$/ {next}
+                {
+                    line=$0
+                    sub(/[[:space:]]+#.*/, "", line)
+                    if (line ~ /(^|[[:space:]])@@?[^[:space:]]+/)
+                        n++
+                }
+                END {print n+0}
+            ' "$f" 2>/dev/null
+        )))
+    done
+
+    if (( count > 0 )); then
+        result INFO "$count possible rsyslog remote destination(s) detected; verify destination, TLS, authentication and delivery"
+    else
+        result UNKNOWN 'no active rsyslog remote destination detected; other forwarding agents or external collection may still be configured'
+    fi
+}
+
+check_privilege_change_logging() {
+    local sudo_log=0 authpriv=0 f
+    for f in /etc/sudoers /etc/sudoers.d/*; do
+        [[ -f "$f" && -r "$f" ]] || continue
+        grep -Eiq '^[[:space:]]*Defaults[[:space:]].*logfile[[:space:]]*=' "$f" 2>/dev/null && sudo_log=1
+    done
+    for f in /etc/rsyslog.conf /etc/rsyslog.d/*; do
+        [[ -f "$f" && -r "$f" ]] || continue
+        grep -Eiq '^[[:space:]]*authpriv\.' "$f" 2>/dev/null && authpriv=1
+    done
+    if (( sudo_log || authpriv )); then result INFO "privileged/authpriv logging indicator detected (sudo-logfile=$sudo_log, rsyslog-authpriv=$authpriv); alert delivery and escalation cannot be verified locally";
+    else result WARN 'no common sudo logfile or rsyslog authpriv rule detected; privilege-change alerting is not confirmed'; fi
+}
+
+check_resource_monitoring() {
+    local matches
+    matches="$(ps -eo comm= 2>/dev/null | grep -Eic '(^|/)(node_exporter|telegraf|zabbix_agentd|datadog-agent|netdata|collectd|check_mk_agent|prometheus)$')"
+    if [[ "$matches" -gt 0 ]]; then result INFO "$matches common resource-monitoring agent process(es) detected; confirm metrics are delivered and alerts configured";
+    else result WARN 'no common resource-monitoring agent process detected; built-in or externally managed monitoring may still exist'; fi
+}
+
+check_backup_immutability() {
+    local matches
+    matches="$(ps -eo comm= 2>/dev/null | grep -Eic '(^|/)(restic|borg|kopia|duplicity|veeam|bacula-fd|bareos-fd|commvault)$')"
+    if (( matches > 0 )); then result INFO "$matches common backup-related process(es) detected; immutable/offline storage and retention lock cannot be proven from this host";
+    else result UNKNOWN 'no common backup process detected; backup may be agentless or externally managed; verify immutable/offline copies with the backup platform'; fi
+}
+
+check_restore_test_evidence() {
+    result UNKNOWN 'a successful restore test cannot be safely proven by a read-only host check; require dated restore-test evidence and validate recovery time/data integrity manually'
+}
+
+check_kernel_security_parameters() {
+    local key value
+    local failed=0
+    local checked=0
+
+    if ! have sysctl; then
+        result UNKNOWN "sysctl command is unavailable"
+        return
+    fi
+
+    local -a settings=(
+        "kernel.kptr_restrict:1"
+        "kernel.dmesg_restrict:1"
+        "net.ipv4.conf.all.accept_redirects:0"
+        "net.ipv4.conf.default.accept_redirects:0"
+        "net.ipv4.conf.all.send_redirects:0"
+        "net.ipv4.conf.default.send_redirects:0"
+        "net.ipv4.conf.all.accept_source_route:0"
+        "net.ipv4.conf.default.accept_source_route:0"
+        "net.ipv4.tcp_syncookies:1"
+    )
+
+    for key in "${settings[@]}"; do
+        value="${key##*:}"
+        key="${key%:*}"
+
+        local actual
+        actual=$(sysctl -n "$key" 2>/dev/null) || continue
+
+        checked=$((checked + 1))
+
+        if [[ "$actual" != "$value" ]]; then
+            failed=$((failed + 1))
+        fi
+    done
+
+    if (( checked == 0 )); then
+        result UNKNOWN "Unable to read kernel security parameters"
+    elif (( failed == 0 )); then
+        result PASS "All $checked supported kernel security parameters have expected values"
+    else
+        result WARN "$failed of $checked kernel security parameters do not have expected values"
+    fi
+}
+
+check_filesystem_mount_options() {
+    local target options
+    local missing=0
+    local checked=0
+
+    if ! have findmnt; then
+        result UNKNOWN "findmnt command is unavailable"
+        return
+    fi
+
+    for target in /tmp /var/tmp /dev/shm; do
+        if ! findmnt --mountpoint "$target" >/dev/null 2>&1; then
+            continue
+        fi
+
+        checked=$((checked + 1))
+        options=$(findmnt -n -o OPTIONS --mountpoint "$target" 2>/dev/null)
+
+        if [[ -z "$options" ]]; then
+            result UNKNOWN "Unable to read mount options for $target"
+            return
+        fi
+
+        [[ ",$options," == *",nodev,"* ]] || missing=$((missing + 1))
+        [[ ",$options," == *",nosuid,"* ]] || missing=$((missing + 1))
+    done
+
+    if (( checked == 0 )); then
+        result UNKNOWN "No separate mount points found for /tmp, /var/tmp, or /dev/shm"
+    elif (( missing == 0 )); then
+        result PASS "Checked temporary mount points have nodev and nosuid"
+    else
+        result WARN "$missing required mount options are missing across $checked mount points"
+    fi
+}
+
+check_auditd_configuration() {
+    local status rules enabled
+
+    if ! have auditctl; then
+        result UNKNOWN "auditctl command is unavailable"
+        return
+    fi
+
+    if have systemctl; then
+        if ! is_active auditd; then
+            result WARN "auditd service is not active"
+            return
+        fi
+    else
+        result UNKNOWN "systemctl command is unavailable"
+        return
+    fi
+
+    status=$(auditctl -s 2>/dev/null) || {
+        result UNKNOWN "Unable to read audit subsystem status"
+        return
+    }
+
+    enabled=$(awk '$1 == "enabled" {print $2; exit}' <<< "$status")
+
+    if [[ "$enabled" != "1" && "$enabled" != "2" ]]; then
+        result WARN "Kernel auditing is not enabled"
+        return
+    fi
+
+    rules=$(auditctl -l 2>/dev/null) || {
+        result UNKNOWN "Unable to read audit rules"
+        return
+    }
+
+    if [[ -z "$rules" || "$rules" == *"No rules"* ]]; then
+        result WARN "No audit rules are configured"
+        return
+    fi
+
+    result PASS "auditd is active, kernel auditing is enabled, and audit rules are present"
+}
+
+check_password_complexity() {
+    local file line found=0
+    local minlen=""
+    local files=(
+        /etc/pam.d/common-password
+        /etc/pam.d/system-auth
+        /etc/pam.d/password-auth
+    )
+
+    for file in "${files[@]}"; do
+        [[ -r "$file" ]] || continue
+
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+            if [[ "$line" =~ pam_pwquality\.so|pam_cracklib\.so ]]; then
+                found=1
+
+                if [[ "$line" =~ minlen=([0-9]+) ]]; then
+                    minlen="${BASH_REMATCH[1]}"
+                fi
+            fi
+        done < "$file"
+    done
+
+    if (( found == 0 )); then
+        result WARN "No active PAM password complexity module was found"
+    elif [[ -z "$minlen" ]]; then
+        result WARN "Password complexity module found, but minlen could not be verified"
+    elif (( minlen >= 12 )); then
+        result PASS "Password complexity module is configured with minlen=$minlen"
+    else
+        result WARN "Password complexity minimum length is $minlen; expected at least 12"
+    fi
+}
+
+check_password_history() {
+    local file line remember=""
+    local found=0
+    local files=(
+        /etc/pam.d/common-password
+        /etc/pam.d/system-auth
+        /etc/pam.d/password-auth
+    )
+
+    for file in "${files[@]}"; do
+        [[ -r "$file" ]] || continue
+
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+            if [[ "$line" =~ pam_pwhistory\.so|pam_unix\.so ]]; then
+                if [[ "$line" =~ remember=([0-9]+) ]]; then
+                    found=1
+                    remember="${BASH_REMATCH[1]}"
+                fi
+            fi
+        done < "$file"
+    done
+
+    if (( found == 0 )); then
+        result WARN "Password history enforcement was not found in the checked PAM files"
+    elif (( remember >= 5 )); then
+        result PASS "Password history is configured to remember $remember passwords"
+    else
+        result WARN "Password history is configured for $remember passwords; expected at least 5"
+    fi
+}
+
+check_password_hashing_algorithm() {
+    local method
+
+    if [[ ! -r /etc/login.defs ]]; then
+        result UNKNOWN "Cannot read /etc/login.defs"
+        return
+    fi
+
+    method=$(awk 'toupper($1) == "ENCRYPT_METHOD" {value=toupper($2)} END {print value}' /etc/login.defs)
+
+    case "$method" in
+        YESCRYPT|SHA512)
+            result PASS "Password hashing algorithm is configured as $method"
+            ;;
+        SHA256)
+            result WARN "Password hashing algorithm is SHA256"
+            ;;
+        MD5|DES|BIGCRYPT)
+            result FAIL "Weak password hashing algorithm configured: $method"
+            ;;
+        "")
+            result UNKNOWN "ENCRYPT_METHOD is not explicitly configured in /etc/login.defs"
+            ;;
+        *)
+            result UNKNOWN "Unrecognized password hashing algorithm: $method"
+            ;;
+    esac
+}
+
+check_account_inactivity() {
+    local inactive
+
+    if ! have useradd; then
+        result UNKNOWN "useradd command is unavailable"
+        return
+    fi
+
+    inactive=$(useradd -D 2>/dev/null | awk -F= '$1 == "INACTIVE" {print $2; exit}')
+
+    if [[ -z "$inactive" ]]; then
+        result UNKNOWN "Unable to determine the default account inactivity setting"
+    elif [[ "$inactive" == "-1" ]]; then
+        result WARN "Default account inactivity expiration is disabled"
+    elif [[ "$inactive" =~ ^[0-9]+$ ]] && (( inactive <= 30 )); then
+        result PASS "Default account inactivity period is $inactive days"
+    elif [[ "$inactive" =~ ^[0-9]+$ ]]; then
+        result WARN "Default account inactivity period is $inactive days; expected 30 or fewer"
+    else
+        result UNKNOWN "Unrecognized account inactivity value: $inactive"
+    fi
+}
+
+check_default_umask() {
+    local file line value=""
+    local files=(
+        /etc/login.defs
+        /etc/profile
+        /etc/bash.bashrc
+    )
+
+    for file in "${files[@]}"; do
+        [[ -r "$file" ]] || continue
+
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+            if [[ "$line" =~ ^[[:space:]]*UMASK[[:space:]]+([0-7]{3,4}) ]]; then
+                value="${BASH_REMATCH[1]}"
+            fi
+        done < "$file"
+    done
+
+    if [[ -z "$value" ]]; then
+        result UNKNOWN "No explicit UMASK setting found in checked configuration files"
+        return
+    fi
+
+    value="${value#0}"
+
+    if [[ ! "$value" =~ ^[0-7]{3}$ ]]; then
+        result UNKNOWN "Unrecognized UMASK value"
+        return
+    fi
+
+    local numeric=$((8#$value))
+
+    if (( (numeric & 002) == 0 && (numeric & 020) == 0 )); then
+        result PASS "UMASK $value prevents group and world write permissions by default"
+    else
+        result WARN "UMASK $value may allow group or world write permissions"
+    fi
+}
+
+check_time_synchronization() {
+    local synchronized=""
+
+    if have timedatectl; then
+        synchronized=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
+
+        if [[ "$synchronized" == "yes" ]]; then
+            result PASS "System time synchronization is active"
+            return
+        fi
+    fi
+
+    if have systemctl; then
+        if is_active systemd-timesyncd || is_active chronyd || is_active chrony || is_active ntp || is_active ntpd; then
+            result WARN "Time synchronization service is active, but synchronization could not be verified"
+            return
+        fi
+    fi
+
+    if [[ -z "$synchronized" ]]; then
+        result UNKNOWN "Unable to verify system time synchronization"
+    else
+        result WARN "System time is not synchronized"
+    fi
+}
+
+check_ssh_cryptographic_settings() {
+    local config ciphers macs kex
+    local weak=0
+
+    if ! have sshd; then
+        result UNKNOWN "sshd command is unavailable"
+        return
+    fi
+
+    config=$(sshd -T 2>/dev/null) || {
+        result UNKNOWN "Unable to retrieve effective SSH configuration"
+        return
+    }
+
+    ciphers=$(awk '$1 == "ciphers" {$1=""; sub(/^[[:space:]]+/, ""); print; exit}' <<< "$config")
+    macs=$(awk '$1 == "macs" {$1=""; sub(/^[[:space:]]+/, ""); print; exit}' <<< "$config")
+    kex=$(awk '$1 == "kexalgorithms" {$1=""; sub(/^[[:space:]]+/, ""); print; exit}' <<< "$config")
+
+    if [[ -z "$ciphers" || -z "$macs" || -z "$kex" ]]; then
+        result UNKNOWN "Unable to identify effective SSH cryptographic settings"
+        return
+    fi
+
+    if grep -Eqi '(^|,)(3des-cbc|aes(128|192|256)-cbc|arcfour[^,]*|blowfish-cbc|cast128-cbc)(,|$)' <<< "$ciphers"; then
+        weak=$((weak + 1))
+    fi
+
+    if grep -Eqi '(^|,)(hmac-sha1|hmac-md5|hmac-md5-96|hmac-sha1-96|umac-64)(,|$)' <<< "$macs"; then
+        weak=$((weak + 1))
+    fi
+
+    if grep -Eqi '(^|,)(diffie-hellman-group1-sha1|diffie-hellman-group14-sha1|diffie-hellman-group-exchange-sha1)(,|$)' <<< "$kex"; then
+        weak=$((weak + 1))
+    fi
+
+    if (( weak == 0 )); then
+        result PASS "No identified weak SSH ciphers, MACs, or key exchange algorithms were found"
+    else
+        result WARN "Weak SSH cryptographic algorithms were detected in $weak configuration categories"
+    fi
+}
+
+check_kernel_module_restrictions() {
+    local module normalized loaded config
+    local available=0
+    local unrestricted=0
+
+    if ! have modprobe || ! have modinfo; then
+        result UNKNOWN "modprobe or modinfo command is unavailable"
+        return
+    fi
+
+    config=$(modprobe -c 2>/dev/null) || {
+        result UNKNOWN "Unable to read effective module configuration"
+        return
+    }
+
+    local -a modules=(
+        cramfs
+        freevxfs
+        jffs2
+        hfs
+        hfsplus
+        udf
+    )
+
+    for module in "${modules[@]}"; do
+        if ! modinfo "$module" >/dev/null 2>&1; then
+            continue
+        fi
+
+        available=$((available + 1))
+        normalized="${module//-/_}"
+
+        loaded=0
+        if [[ -r /proc/modules ]] && awk -v m="$normalized" '$1 == m {found=1} END {exit !found}' /proc/modules; then
+            loaded=1
+        fi
+
+        if (( loaded == 1 )); then
+            unrestricted=$((unrestricted + 1))
+            continue
+        fi
+
+        if ! awk -v m="$normalized" '
+            $1 == "install" {
+                name=$2
+                gsub(/-/, "_", name)
+                if (name == m && ($3 == "/bin/true" || $3 == "/bin/false" || $3 == "true" || $3 == "false")) {
+                    found=1
+                }
+            }
+            END {exit !found}
+        ' <<< "$config"; then
+            unrestricted=$((unrestricted + 1))
+        fi
+    done
+
+    if (( available == 0 )); then
+        result UNKNOWN "None of the checked kernel modules are available"
+    elif (( unrestricted == 0 )); then
+        result PASS "All $available available restricted filesystem modules are disabled"
+    else
+        result WARN "$unrestricted of $available available restricted filesystem modules are not adequately disabled"
+    fi
+}
+
+check_aslr_configuration() {
+    local value
+
+    if ! have sysctl; then
+        result UNKNOWN "sysctl command is unavailable"
+        return
+    fi
+
+    value=$(sysctl -n kernel.randomize_va_space 2>/dev/null) || {
+        result UNKNOWN "Unable to read ASLR configuration"
+        return
+    }
+
+    if [[ "$value" == "2" ]]; then
+        result PASS "ASLR is fully enabled"
+    elif [[ "$value" == "1" ]]; then
+        result WARN "ASLR is partially enabled; expected value is 2"
+    elif [[ "$value" == "0" ]]; then
+        result FAIL "ASLR is disabled"
+    else
+        result UNKNOWN "Unrecognized ASLR setting: $value"
+    fi
+}
+
+check_core_dump_restrictions() {
+    local suid_value config storage process_size
+
+    if ! have sysctl; then
+        result UNKNOWN "sysctl command is unavailable"
+        return
+    fi
+
+    suid_value=$(sysctl -n fs.suid_dumpable 2>/dev/null) || {
+        result UNKNOWN "Unable to read fs.suid_dumpable"
+        return
+    }
+
+    if [[ "$suid_value" != "0" ]]; then
+        result WARN "fs.suid_dumpable is $suid_value; expected 0"
+        return
+    fi
+
+    if ! have systemd-analyze; then
+        result UNKNOWN "systemd-analyze command is unavailable"
+        return
+    fi
+
+    config=$(systemd-analyze cat-config systemd/coredump.conf 2>/dev/null) || {
+        result UNKNOWN "Unable to read effective systemd-coredump configuration"
+        return
+    }
+
+    storage=$(awk '
+        /^[[:space:]]*#/ {next}
+        /^[[:space:]]*Storage[[:space:]]*=/ {
+            sub(/^[^=]*=/, "")
+            gsub(/[[:space:]]/, "")
+            value=tolower($0)
+        }
+        END {print value}
+    ' <<< "$config")
+
+    process_size=$(awk '
+        /^[[:space:]]*#/ {next}
+        /^[[:space:]]*ProcessSizeMax[[:space:]]*=/ {
+            sub(/^[^=]*=/, "")
+            gsub(/[[:space:]]/, "")
+            value=tolower($0)
+        }
+        END {print value}
+    ' <<< "$config")
+
+    if [[ "$storage" == "none" || "$process_size" == "0" ]]; then
+        result PASS "Core dump restrictions are configured"
+    else
+        result WARN "Core dump storage or processing is not explicitly disabled"
+    fi
+}
+
+check_ptrace_restrictions() {
+    local value
+
+    if ! have sysctl; then
+        result UNKNOWN "sysctl command is unavailable"
+        return
+    fi
+
+    value=$(sysctl -n kernel.yama.ptrace_scope 2>/dev/null) || {
+        result UNKNOWN "Yama ptrace_scope is unavailable"
+        return
+    }
+
+    if [[ "$value" =~ ^[0-3]$ ]] && (( value >= 1 )); then
+        result PASS "Ptrace restrictions are enabled with scope $value"
+    elif [[ "$value" == "0" ]]; then
+        result WARN "Ptrace restrictions are disabled"
+    else
+        result UNKNOWN "Unrecognized ptrace_scope value: $value"
+    fi
+}
+
+check_ipv6_security() {
+    local key value
+    local failed=0
+    local checked=0
+
+    if ! have sysctl; then
+        result UNKNOWN "sysctl command is unavailable"
+        return
+    fi
+
+    local -a settings=(
+        "net.ipv6.conf.all.accept_redirects"
+        "net.ipv6.conf.default.accept_redirects"
+        "net.ipv6.conf.all.accept_source_route"
+        "net.ipv6.conf.default.accept_source_route"
+    )
+
+    for key in "${settings[@]}"; do
+        value=$(sysctl -n "$key" 2>/dev/null) || continue
+
+        checked=$((checked + 1))
+
+        if [[ "$value" != "0" ]]; then
+            failed=$((failed + 1))
+        fi
+    done
+
+    if (( checked == 0 )); then
+        result UNKNOWN "IPv6 security parameters are unavailable or IPv6 is unsupported"
+    elif (( failed == 0 )); then
+        result PASS "All $checked checked IPv6 security parameters are configured securely"
+    else
+        result WARN "$failed of $checked IPv6 security parameters do not have expected values"
+    fi
+}
+
+check_usb_storage_restrictions() {
+    local config loaded
+
+    if ! have modprobe || ! have modinfo; then
+        result UNKNOWN "modprobe or modinfo command is unavailable"
+        return
+    fi
+
+    if ! modinfo usb-storage >/dev/null 2>&1; then
+        result UNKNOWN "USB storage module is unavailable"
+        return
+    fi
+
+    config=$(modprobe -c 2>/dev/null) || {
+        result UNKNOWN "Unable to read effective module configuration"
+        return
+    }
+
+    loaded=0
+    if [[ -r /proc/modules ]] && awk '$1 == "usb_storage" {found=1} END {exit !found}' /proc/modules; then
+        loaded=1
+    fi
+
+    if (( loaded == 1 )); then
+        result WARN "USB storage module is currently loaded"
+        return
+    fi
+
+    if awk '
+        $1 == "install" {
+            name=$2
+            gsub(/-/, "_", name)
+            if (name == "usb_storage" && ($3 == "/bin/true" || $3 == "/bin/false" || $3 == "true" || $3 == "false")) {
+                found=1
+            }
+        }
+        END {exit !found}
+    ' <<< "$config"; then
+        result PASS "USB storage module loading is disabled"
+    else
+        result WARN "USB storage module is not explicitly disabled"
+    fi
+}
+
+check_disk_encryption() {
+    local root_source types
+
+    if ! have findmnt || ! have lsblk; then
+        result UNKNOWN "findmnt or lsblk command is unavailable"
+        return
+    fi
+
+    root_source=$(findmnt -n -o SOURCE / 2>/dev/null) || {
+        result UNKNOWN "Unable to identify root filesystem source"
+        return
+    }
+
+    if [[ -z "$root_source" || "$root_source" != /dev/* ]]; then
+        result UNKNOWN "Root filesystem source is not a directly identifiable block device"
+        return
+    fi
+
+    types=$(lsblk -s -n -o TYPE "$root_source" 2>/dev/null) || {
+        result UNKNOWN "Unable to inspect root filesystem block device"
+        return
+    }
+
+    if grep -qx "crypt" <<< "$types"; then
+        result PASS "Root filesystem is backed by a detected encrypted block device"
+    else
+        result WARN "No encrypted block device was detected in the root filesystem chain"
+    fi
+}
+
+check_package_integrity() {
+    local output status
+
+    if ! have dpkg; then
+        result UNKNOWN "dpkg command is unavailable"
+        return
+    fi
+
+    output=$(dpkg -V 2>&1)
+    status=$?
+
+    if (( status != 0 )); then
+        result UNKNOWN "Package integrity verification could not be completed"
+    elif [[ -z "$output" ]]; then
+        result PASS "No package file integrity differences were reported by dpkg"
+    else
+        result WARN "Package integrity verification reported modified or missing files"
+    fi
+}
+
+# ---------- Test registry and resilient runner ----------
+TEST_NAMES=(
+    'SSH Root Login Disabled'
+    'SSH Password Authentication'
+    'Root Account Status'
+    'Unexpected UID 0 Accounts'
+    'Empty Password Fields'
+    'Sudo NOPASSWD Rules'
+    'Password Aging Policy'
+    'PAM Account Lockout'
+    'MFA Configuration Detection'
+    'SSH Management Access Restrictions'
+    'Listening Network Sockets'
+    'Telnet Service Exposure'
+    'FTP Server Exposure'
+    'Samba SMB Protocol'
+    'SNMPv3 Configuration'
+    'Host Firewall Status'
+    'Reboot Required Indicator'
+    'Secure Boot Status'
+    'SELinux or AppArmor Enforcement'
+    'Automatic Security Updates'
+    'GRUB Password Protection'
+    'Critical Account File Permissions'
+    'SUID SGID Binary Inventory'
+    'World Writable File Inventory'
+    'Cron Access Control'
+    'Linux Capabilities Inventory'
+    'Administrative Group Membership'
+    'Non-system User Account Inventory'
+    'SSH authorized_keys Metadata'
+    'Enabled systemd Services'
+    'Cron Persistence Inventory'
+    'Legacy Startup Script'
+    'File Integrity Monitoring Presence'
+    'Authentication Log Availability'
+    'EDR Host Protection Presence'
+    'Remote Log Forwarding'
+    'Privilege Change Logging Indicators'
+    'CPU RAM Monitoring Agent Presence'
+    'Backup and Immutability Indicators'
+    'Restore Test Evidence'
+    'Kernel Security Parameters'
+    'Filesystem Mount Options'
+    'Auditd Configuration'
+    'Password Complexity'
+    'Password History'
+    'Password Hashing Algorithm'
+    'Account Inactivity'
+    'Default Umask'
+    'System Time Synchronization'
+    'SSH Cryptographic Settings'
+    'Kernel Module Restrictions'
+    'ASLR Configuration'
+    'Core Dump Restrictions'
+    'ptrace Restrictions'
+    'IPv6 Security'
+    'USB Storage Restrictions'
+    'Disk Encryption'
+    'Package Integrity'
+)
+
+TEST_CIS_IDS=(
+    '5.1.20'
+    'none'
+    '5.4.2.4'
+    'none'
+    '7.2.2'
+    '5.2.4'
+    '5.4.1.1'
+    '5.3.3.1.1-5.3.3.1.3'
+    'none'
+    '5.1.4'
+    '2.1.22'
+    '2.2.4'
+    '2.1.6'
+    '2.1.14'
+    '2.1.15'
+    '4.1.1, 4.2.x, 4.3.x, 4.4.x'
+    'none'
+    'none'
+    '1.3.1.3'
+    '1.2.2.1'
+    '1.4.1'
+    '7.1.1-7.1.8'
+    '7.1.13'
+    '7.1.11'
+    '2.4.1.8, 2.4.2.1'
+    'none'
+    'none'
+    '5.4.2.7'
+    'none'
+    '2.1.22'
+    '2.4.1.x'
+    'none'
+    '6.3.1, 6.3.2'
+    '6.1.1.1'
+    'none'
+    '6.1.2.1.1-6.1.2.1.3'
+    '5.2.3'
+    'none'
+    'none'
+    'none'
+    '3.3.2, 3.3.5, 3.3.8, 3.3.10'
+    '1.1.2.1.x, 1.1.2.2.x, 1.1.2.5.x'
+    '6.2.1.x, 6.2.2.x, 6.2.3.x'
+    '5.3.3.2.1-5.3.3.2.8'
+    '5.3.3.3.1-5.3.3.3.3'
+    '5.3.3.4.3, 5.4.1.4'
+    '5.4.1.5'
+    '5.4.2.6, 5.4.3.3'
+    '2.3.1.1, 2.3.2.x, 2.3.3.x'
+    '5.1.6, 5.1.15'
+    '1.1.1.1-1.1.1.5'
+    '1.5.1'
+    '1.5.3'
+    '1.5.2'
+    '3.3.11'
+    '1.1.1.9'
+    'none'
+    'none'
+)
+
+TEST_FUNCTIONS=(
+    check_ssh_root_login
+    check_ssh_password_auth
+    check_root_account
+    check_uid0_accounts
+    check_empty_passwords
+    check_sudo_nopasswd
+    check_password_max_days
+    check_pam_lockout
+    check_mfa_config
+    check_ssh_access_restrictions
+    check_listening_sockets
+    check_telnet_service
+    check_ftp_service
+    check_samba_smb
+    check_snmpv3
+    check_firewall
+    check_update_reboot_flag
+    check_secure_boot
+    check_mac_framework
+    check_automatic_updates
+    check_grub_password
+    check_critical_file_permissions
+    check_suid_sgid
+    check_world_writable_files
+    check_cron_access
+    check_linux_capabilities
+    check_admin_groups
+    check_user_account_inventory
+    check_authorized_keys
+    check_systemd_enabled_services
+    check_cron_persistence_inventory
+    check_legacy_startup
+    check_file_integrity_monitoring
+    check_authentication_logs
+    check_edr_presence
+    check_remote_log_forwarding
+    check_privilege_change_logging
+    check_resource_monitoring
+    check_backup_immutability
+    check_restore_test_evidence
+    check_kernel_security_parameters
+    check_filesystem_mount_options
+    check_auditd_configuration
+    check_password_complexity
+    check_password_history
+    check_password_hashing_algorithm
+    check_account_inactivity
+    check_default_umask
+    check_time_synchronization
+    check_ssh_cryptographic_settings
+    check_kernel_module_restrictions
+    check_aslr_configuration
+    check_core_dump_restrictions
+    check_ptrace_restrictions
+    check_ipv6_security
+    check_usb_storage_restrictions
+    check_disk_encryption
+    check_package_integrity
+)
+
+TOTAL_TESTS="${#TEST_FUNCTIONS[@]}"
+INDEX=0
+PASS_COUNT=0
+WARN_COUNT=0
+FAIL_COUNT=0
+INFO_COUNT=0
+UNKNOWN_COUNT=0
+ERROR_COUNT=0
+
+HOST_NAME="$(hostname -f 2>/dev/null || hostname 2>/dev/null || printf 'unknown')"
+DISTRO_NAME="$(awk -F= '$1=="PRETTY_NAME" {gsub(/^"|"$/, "", $2); print $2; exit}' /etc/os-release 2>/dev/null)"
+[[ -n "$DISTRO_NAME" ]] || DISTRO_NAME="unknown Linux distribution"
+RUN_TIME="$(date -Is 2>/dev/null || date '+%Y-%m-%d %H:%M:%S %z')"
+
+show_banner
+log_line '======================================================================'
+log_line 'Nasaru LINUX SERVER HARDENING AUDIT By M0G3H'
+log_line "Timestamp : $RUN_TIME"
+log_line "Hostname  : $HOST_NAME"
+log_line "OS        : $DISTRO_NAME"
+log_line "Kernel    : $(uname -r 2>/dev/null || printf 'unknown')"
+log_line "Run as    : $([[ "$(id -u 2>/dev/null)" == 0 ]] && printf 'root' || printf 'non-root')"
+log_line "Report    : $REPORT_FILE"
+log_line 'Mode      : READ-ONLY (no configuration changes, no network scan)'
+log_line 'Scope     : Linux only; Auditd/Windows Security Auditing test intentionally excluded'
+log_line '----------------------------------------------------------------------'
+
+run_check() {
+    local name="$1" fn="$2" cis_id="$3" raw rc status detail
+    INDEX=$((INDEX + 1))
+
+    # The function runs in a subshell. A command failure is captured here and
+    # cannot terminate the parent script or prevent subsequent tests.
+    raw="$("$fn" 2>&1)"
+    rc=$?
+    if (( rc != 0 )); then
+        status='ERROR'
+        detail="test function returned non-zero exit code $rc"
+    elif [[ "$raw" == *'|'* ]]; then
+        status="${raw%%|*}"
+        detail="${raw#*|}"
+        case "$status" in PASS|WARN|FAIL|INFO|UNKNOWN|ERROR) ;;
+            *) status='ERROR'; detail='test returned an invalid status format';;
+        esac
+    else
+        status='ERROR'
+        detail='test returned no valid STATUS|DETAIL result'
+    fi
+
+    # Keep every result on one line so a single malformed command cannot
+    # corrupt the report layout.
+    detail="${detail//$'\n'/ }"
+    detail="${detail//$'\r'/ }"
+    detail="${detail//|/\/}"
+
+    case "$status" in
+        PASS) PASS_COUNT=$((PASS_COUNT + 1));;
+        WARN) WARN_COUNT=$((WARN_COUNT + 1));;
+        FAIL) FAIL_COUNT=$((FAIL_COUNT + 1));;
+        INFO) INFO_COUNT=$((INFO_COUNT + 1));;
+        UNKNOWN) UNKNOWN_COUNT=$((UNKNOWN_COUNT + 1));;
+        ERROR) ERROR_COUNT=$((ERROR_COUNT + 1));;
+    esac
+    local result_line color
+    result_line="[$(printf '%02d' "$INDEX")/$TOTAL_TESTS] [✓] $name | CIS-ID=\"$cis_id\" | STATUS=$status | $detail"
+
+    case "$status" in
+        PASS)    color='\033[32m' ;;       # Green
+        WARN)    color='\033[31m' ;;       # Red, as requested
+        FAIL)    color='\033[1;31m' ;;     # Bold red
+        INFO)    color='\033[36m' ;;       # Cyan
+        UNKNOWN) color='\033[33m' ;;       # Yellow
+        ERROR)   color='\033[35m' ;;       # Magenta
+        *)       color='\033[0m' ;;
+    esac
+
+    log_result "$result_line" "$color"
+}
+
+for i in "${!TEST_FUNCTIONS[@]}"; do
+    run_check "${TEST_NAMES[$i]}" "${TEST_FUNCTIONS[$i]}" "${TEST_CIS_IDS[$i]}"
+done
+
+log_line '----------------------------------------------------------------------'
+log_line "SUMMARY | TOTAL=$TOTAL_TESTS | PASS=$PASS_COUNT | WARN=$WARN_COUNT | FAIL=$FAIL_COUNT | INFO=$INFO_COUNT | UNKNOWN=$UNKNOWN_COUNT | ERROR=$ERROR_COUNT"
+log_line 'END OF AUDIT'
+log_line '======================================================================'
+
+# Return success if the audit completed. Findings are reported in the file;
+# they do not make the audit process itself fail.
+exit 0
