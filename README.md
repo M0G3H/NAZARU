@@ -102,19 +102,19 @@ cd NAZARU
 ### 3. Make the Script Executable
 
 ```bash
-chmod +x Nasaru.sh
+chmod +x Nazaru
 ```
 
 ### 4. Run a Security Assessment
 
 ```bash
-./Nasaru.sh
+./Nazaru
 ```
 
 Alternatively:
 
 ```bash
-bash Nasaru.sh
+bash Nazaru
 ```
 
 ### 5. Save the Assessment Report
@@ -122,7 +122,7 @@ bash Nasaru.sh
 Provide a report filename as an argument:
 
 ```bash
-./Nasaru.sh nazaru_report.txt
+./Nazaru nazaru_report.txt
 ```
 
 The results will be displayed in the terminal and saved to the specified report file.
@@ -130,7 +130,7 @@ The results will be displayed in the terminal and saved to the specified report 
 ### 6. Run with Elevated Privileges (Optional)
 
 ```bash
-sudo ./Nasaru.sh
+sudo ./Nazaru
 ```
 
 Running with elevated privileges can improve visibility into protected files, system configurations, and security settings. Use it when a more complete assessment is required.
@@ -148,11 +148,6 @@ Running with elevated privileges can improve visibility into protected files, sy
 
 ---
 
-## 📄 License
-
-Add your preferred open-source license before publishing the project. If you choose MIT, include the corresponding `LICENSE` file in the repository.
-
----
 
 <p align="center">
   **🛡️ NAZARU — See the Weakness. Strengthen the System.**
