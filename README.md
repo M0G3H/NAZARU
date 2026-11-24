@@ -3,9 +3,6 @@
 </p>
 
 
-<p align="center">
-  **A lightweight, local-first Linux security auditing tool designed to identify security weaknesses, misconfigurations, and hardening gaps.**
-</p>
 
 ---
 ## Origin of the Name – NAZARU
