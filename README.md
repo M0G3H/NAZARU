@@ -2,8 +2,6 @@
   <img src="./nazaru-banner.png" alt="NAZARU — The Digital Guardian" width="100%">
 </p>
 
-# 🛡️ NAZARU
-### Linux Security Auditing & Hardening Assessment Tool
 
 <p align="center">
   **A lightweight, local-first Linux security auditing tool designed to identify security weaknesses, misconfigurations, and hardening gaps.**
