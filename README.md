@@ -12,7 +12,7 @@
 The name **NAZARU** is inspired by the ancient Akkadian words Naṣāru (to guard, protect, and preserve) and Nāṣiru (guardian or protector).
 
 Inspired by these meanings, NAZARU represents the mission of the tool: to identify security weaknesses, protect Linux systems, and help preserve their integrity.
----
+
 
 ---
 
