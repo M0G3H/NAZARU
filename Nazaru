@@ -1,12 +1,85 @@
 #!/usr/bin/env bash
-# Usage: bash Nazaru [report-file]
-# Optional environment variable: REPORT_FILE=/path/to/report.txt
-# Missing tools/permissions are reported as UNKNOWN
+# Nazaru 1.3.1 - Read-only Ubuntu Server security auditing tool
+# Usage: ./nazaru.sh [-o report.txt] [-q] [-d] [-h] [-v] [-x [report.xml]]
+# Legacy positional report path and REPORT_FILE environment variable remain supported.
 
 set -o pipefail
 umask 077
 
-REPORT_FILE="${1:-${REPORT_FILE:-./server_audit_report.txt}}"
+VERSION="1.3.6"
+QUIET_MODE=0
+DESCRIPTION_MODE=0
+XML_ENABLED=0
+XML_FILE="./nazaru_report.xml"
+REPORT_FILE="${REPORT_FILE:-./server_audit_report.txt}"
+POSITIONAL_REPORT=""
+
+show_help() {
+    cat <<EOF
+Nazaru $VERSION - Read-only Linux Server Security Audit
+
+Usage:
+  $0 [OPTIONS] [report-file]
+
+Options:
+  -o FILE       Save the plain-text audit report to FILE
+  -q            Quiet scan: show only WARN, FAIL and ERROR results on terminal
+  -d            Include test descriptions in the report and terminal output
+  -h            Show this help and exit
+  -v            Show version and exit
+  -x [FILE]     Generate an XML report (default: ./nazaru_report.xml)
+
+Examples:
+  $0
+  $0 -o report.txt
+  $0 -q -o report.txt
+  $0 -d -o detailed_report.txt
+  $0 -x
+  $0 -o report.txt -x report.xml
+
+The audit is read-only. It does not modify system configuration or perform network scans.
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        -o)
+            (($# >= 2)) || { printf 'ERROR: -o requires a report filename\n' >&2; exit 2; }
+            REPORT_FILE="$2"; shift 2 ;;
+        -q)
+            QUIET_MODE=1; shift ;;
+        -d)
+            DESCRIPTION_MODE=1; shift ;;
+        -h|--help)
+            show_help; exit 0 ;;
+        -v|--version)
+            printf 'Nazaru %s\n' "$VERSION"; exit 0 ;;
+        -x)
+            XML_ENABLED=1
+            if (($# >= 2)) && [[ "$2" != -* ]]; then XML_FILE="$2"; shift 2; else shift; fi ;;
+        --)
+            shift
+            if (($#)); then
+                [[ -z "$POSITIONAL_REPORT" ]] || { printf 'ERROR: only one positional report path is supported\n' >&2; exit 2; }
+                POSITIONAL_REPORT="$1"; shift
+            fi
+            (($# == 0)) || { printf 'ERROR: unexpected argument(s)\n' >&2; exit 2; } ;;
+        -* )
+            printf 'ERROR: unknown option: %s\n' "$1" >&2
+            printf 'Use -h to see available options.\n' >&2
+            exit 2 ;;
+        *)
+            [[ -z "$POSITIONAL_REPORT" ]] || { printf 'ERROR: only one positional report path is supported\n' >&2; exit 2; }
+            POSITIONAL_REPORT="$1"; shift ;;
+    esac
+done
+[[ -n "$POSITIONAL_REPORT" ]] && REPORT_FILE="$POSITIONAL_REPORT"
+
+if (( XML_ENABLED )) && [[ "$XML_FILE" == "$REPORT_FILE" ]]; then
+    printf 'ERROR: text and XML report paths must be different\n' >&2
+    exit 2
+fi
+
 REPORT_DIR="$(dirname -- "$REPORT_FILE")"
 if ! mkdir -p -- "$REPORT_DIR" 2>/dev/null; then
     printf 'ERROR: cannot create report directory: %s\n' "$REPORT_DIR" >&2
@@ -15,6 +88,13 @@ fi
 if ! touch -- "$REPORT_FILE" 2>/dev/null; then
     printf 'ERROR: cannot write report file: %s\n' "$REPORT_FILE" >&2
     exit 2
+fi
+if (( XML_ENABLED )); then
+    XML_DIR="$(dirname -- "$XML_FILE")"
+    if ! mkdir -p -- "$XML_DIR" 2>/dev/null || ! : > "$XML_FILE" 2>/dev/null; then
+        printf 'ERROR: cannot create XML report: %s\n' "$XML_FILE" >&2
+        exit 2
+    fi
 fi
 
 LOCK_MODE="none"
@@ -37,6 +117,10 @@ else
     LOCK_MODE="mkdir"
     trap 'rmdir -- "$LOCK_DIR" 2>/dev/null || true' EXIT
 fi
+if ! : > "$REPORT_FILE" 2>/dev/null; then
+    printf 'ERROR: cannot initialize report file: %s\n' "$REPORT_FILE" >&2
+    exit 2
+fi
 
 show_banner() {
     printf '\033[36m'
@@ -52,12 +136,45 @@ EOF
 }
 
 log_line() {
-    # Non-result output is mirrored unchanged to terminal and report.
-    printf '%s
-' "$1" | tee -a "$REPORT_FILE"
+    printf '%s\n' "$1" >> "$REPORT_FILE" || {
+        printf 'ERROR: cannot append to report file: %s\n' "$REPORT_FILE" >&2
+        exit 2
+    }
+    (( QUIET_MODE )) || printf '%s\n' "$1"
+}
+
+# Header metadata is always displayed, including in quiet mode.
+log_header_line() {
+    printf '%s\n' "$1" >> "$REPORT_FILE" || {
+        printf 'ERROR: cannot append to report file: %s\n' "$REPORT_FILE" >&2
+        exit 2
+    }
+    printf '%s\n' "$1"
+}
+
+log_alert() {
+    local message="$1"
+    printf '%s\n' "$message" >> "$REPORT_FILE" || exit 2
+    printf '\033[1;31m%s\033[0m\n' "$message"
 }
 
 log_result() {
+    local line="$1" prefix="$2" status_tag="$3" detail="$4" color="$5" status="$6"
+    printf '%s\n' "$line" >> "$REPORT_FILE" || {
+        printf 'ERROR: cannot append to report file: %s\n' "$REPORT_FILE" >&2
+        exit 2
+    }
+    if (( ! QUIET_MODE )) || [[ "$status" == WARN || "$status" == FAIL || "$status" == ERROR ]]; then
+        printf '%s' "$prefix"
+        printf '%b%s\033[0m' "$color" "$status_tag"
+        if (( DESCRIPTION_MODE )); then
+            printf ' [%s]\n' "$detail"
+        else
+            printf '\n'
+        fi
+    fi
+}
+result() {
     local line="$1" color="$2"
     # Keep the report file plain text; apply ANSI color only in the terminal.
     if ! printf '%s
@@ -66,8 +183,7 @@ log_result() {
 ' "$REPORT_FILE" >&2
         exit 2
     fi
-    printf '%b%s%b
-' "$color" "$line" '[0m'
+    printf '%b%s\033[0m\n' "$color" "$line"
 }
 
 result() {
@@ -175,16 +291,20 @@ check_empty_passwords() {
 
 check_sudo_nopasswd() {
     local files=(/etc/sudoers)
-    local count=0 f n
+    local count=0 f n syntax='not-checked'
     [[ -d /etc/sudoers.d ]] && files+=(/etc/sudoers.d/*)
     for f in "${files[@]}"; do
         [[ -f "$f" && -r "$f" ]] || continue
         n="$(grep -Ehv '^[[:space:]]*#|^[[:space:]]*$' "$f" 2>/dev/null | grep -Eo 'NOPASSWD:' 2>/dev/null | wc -l)"
         count=$((count + n))
     done
+    if have visudo && [[ -r /etc/sudoers ]]; then
+        if visudo -c >/dev/null 2>&1; then syntax='valid'; else syntax='invalid'; fi
+    fi
     if [[ ! -r /etc/sudoers ]]; then result UNKNOWN 'sudoers files are not readable';
-    elif [[ "$count" -eq 0 ]]; then result PASS 'no active NOPASSWD directives detected';
-    else result WARN "$count active NOPASSWD directive(s) detected; validate each exception against policy"; fi
+    elif [[ "$syntax" == invalid ]]; then result WARN "visudo -c reports a sudoers syntax/configuration problem; NOPASSWD directives found=$count";
+    elif [[ "$count" -eq 0 ]]; then result PASS "no active NOPASSWD directives detected; sudoers syntax=$syntax";
+    else result WARN "$count active NOPASSWD directive(s) detected; sudoers syntax=$syntax; validate each exception against policy"; fi
 }
 
 check_password_max_days() {
@@ -240,13 +360,13 @@ check_ssh_access_restrictions() {
 check_listening_sockets() {
     local output count
     if have ss; then
-        output="$(ss -H -lnt 2>/dev/null)" || { result UNKNOWN 'ss failed; try with root for complete socket visibility'; return; }
+        output="$(ss -H -lntup 2>/dev/null)" || { result UNKNOWN 'ss failed; run with root for process and complete socket visibility'; return; }
         count="$(printf '%s\n' "$output" | count_matching_lines)"
-        result INFO "$count TCP listening socket(s) detected; inspect with: ss -lntup (process names may require root)"
+        result INFO "$count TCP/UDP listening socket(s) detected by ss -lntup; review exposed services against the host role"
     elif have netstat; then
-        output="$(netstat -lnt 2>/dev/null)" || { result UNKNOWN 'netstat failed'; return; }
+        output="$(netstat -lntup 2>/dev/null)" || { result UNKNOWN 'netstat failed'; return; }
         count="$(printf '%s\n' "$output" | awk 'NR>2 && NF {n++} END {print n+0}')"
-        result INFO "$count TCP listening socket(s) detected; install iproute2 for ss if a fuller view is needed"
+        result INFO "$count TCP/UDP listening socket(s) detected; process visibility may require root"
     else
         result UNKNOWN 'neither ss nor netstat is installed; ss is provided by iproute2'
     fi
@@ -323,18 +443,25 @@ check_snmpv3() {
 }
 
 check_firewall() {
-    local state rules
+    local state rules defaults
     if have ufw; then
         state="$(ufw status 2>/dev/null | awk -F: 'tolower($1) ~ /^status/ {gsub(/^[[:space:]]+/,"",$2); print tolower($2); exit}')"
-        [[ "$state" == active ]] && { result INFO 'UFW reports active'; return; }
+        if [[ "$state" == active ]]; then
+            defaults='not-readable'
+            if [[ -r /etc/default/ufw ]]; then
+                defaults="$(awk -F= '/^[[:space:]]*DEFAULT_(INPUT|OUTPUT|FORWARD)_POLICY=/ {gsub(/["[:space:]]/,"",$2); printf "%s%s=%s", sep, $1, $2; sep=","}' /etc/default/ufw)"
+            fi
+            result INFO "UFW is active; default policies=${defaults:-not-explicitly-found}; inspect 'ufw status verbose' and numbered rules for full validation"
+            return
+        fi
     fi
     if have firewall-cmd; then
         state="$(firewall-cmd --state 2>/dev/null)"
-        [[ "$state" == running ]] && { result INFO 'firewalld reports running; validate zone and service rules'; return; }
+        [[ "$state" == running ]] && { result INFO 'firewalld is running; inspect active zones and services with firewall-cmd --get-active-zones and --list-all'; return; }
     fi
     if have nft; then
         rules="$(nft list ruleset 2>/dev/null)"
-        if [[ -n "$rules" ]]; then result INFO 'nftables ruleset exists; default policies and interface coverage require manual review'; return; fi
+        if [[ -n "$rules" ]]; then result INFO 'nftables ruleset exists; inspect input/forward chain policies and interface coverage'; return; fi
     fi
     if have iptables; then
         rules="$(iptables -S 2>/dev/null)"
@@ -342,10 +469,10 @@ check_firewall() {
             if printf '%s\n' "$rules" | grep -Eq '^-P INPUT (DROP|REJECT)|^-P FORWARD (DROP|REJECT)'; then
                 result INFO 'iptables has a DROP/REJECT default policy on INPUT/FORWARD'; return
             fi
-            result WARN 'iptables rules exist but a restrictive default policy was not confirmed'; return
+            result WARN 'iptables rules exist but restrictive INPUT/FORWARD default policies were not confirmed'; return
         fi
     fi
-    result UNKNOWN 'no active host firewall could be confirmed; permissions may be insufficient or no firewall frontend is installed'
+    result WARN 'no active host firewall with a restrictive policy could be confirmed; verify whether another firewall layer protects this host'
 }
 
 check_update_reboot_flag() {
@@ -459,9 +586,25 @@ check_world_writable_files() {
 }
 
 check_cron_access() {
-    if [[ -f /etc/cron.allow ]]; then result INFO '/etc/cron.allow exists; verify its contents and ownership manually';
-    elif [[ -f /etc/cron.deny ]]; then result WARN 'only /etc/cron.deny exists; cron may be available to all users except denied users';
-    else result WARN 'neither /etc/cron.allow nor /etc/cron.deny exists; review local cron access policy'; fi
+    local cron_state at_state f bad=0
+    if [[ -f /etc/cron.allow ]]; then cron_state='cron.allow-present'
+    elif [[ -f /etc/cron.deny ]]; then cron_state='cron.deny-only'
+    else cron_state='no-cron-allow-or-deny'; fi
+    if [[ -f /etc/at.allow ]]; then at_state='at.allow-present'
+    elif [[ -f /etc/at.deny ]]; then at_state='at.deny-only'
+    else at_state='no-at-allow-or-deny'; fi
+    for f in /etc/cron.allow /etc/cron.deny /etc/at.allow /etc/at.deny; do
+        [[ -e "$f" ]] || continue
+        if have stat; then
+            [[ "$(stat -c '%U:%G' "$f" 2>/dev/null)" == root:root ]] || bad=$((bad + 1))
+            local mode
+            mode="$(stat -c '%a' "$f" 2>/dev/null)"
+            [[ "$mode" =~ ^[0-7]+$ ]] && (( (8#$mode & 0022) == 0 )) || bad=$((bad + 1))
+        fi
+    done
+    if (( bad > 0 )); then result WARN "cron=$cron_state; at=$at_state; $bad access-control file ownership/permission issue(s) detected";
+    elif [[ "$cron_state" == cron.allow-present && "$at_state" == at.allow-present ]]; then result INFO 'cron and at allow-lists exist; verify approved users and root:root restrictive permissions';
+    else result WARN "cron=$cron_state; at=$at_state; review default access behavior and consider explicit allow-lists"; fi
 }
 
 check_linux_capabilities() {
@@ -1278,7 +1421,422 @@ check_package_integrity() {
     fi
 }
 
+
+check_legal_login_banners() {
+    local f missing=0 bad=0 found=0 mode owner
+    for f in /etc/issue /etc/issue.net /etc/motd; do
+        if [[ ! -e "$f" ]]; then
+            missing=$((missing + 1))
+            continue
+        fi
+        found=$((found + 1))
+        if [[ ! -s "$f" ]]; then missing=$((missing + 1)); fi
+        if have stat; then
+            mode="$(stat -c '%a' "$f" 2>/dev/null)"
+            owner="$(stat -c '%U:%G' "$f" 2>/dev/null)"
+            [[ "$owner" == root:root ]] || bad=$((bad + 1))
+            [[ "$mode" =~ ^[0-7]+$ ]] && (( (8#$mode & 0022) == 0 )) || bad=$((bad + 1))
+        fi
+    done
+    local ssh_banner
+    ssh_banner="$(sshd_value banner 2>/dev/null)"
+    if (( found == 0 )); then
+        result WARN 'no standard local/remote login banner files were found'
+    elif (( bad > 0 )); then
+        result WARN "$found banner file(s) found; $bad ownership/permission issue(s); sshd Banner=${ssh_banner:-not-configured}"
+    elif [[ -n "$ssh_banner" && "$ssh_banner" != none ]]; then
+        result PASS "$found standard banner file(s) found with restrictive ownership/permissions; SSH Banner=$ssh_banner"
+    else
+        result INFO "$found standard banner file(s) found with restrictive ownership/permissions; SSH Banner is not configured"
+    fi
+}
+
+check_gdm_configuration() {
+    local status config banner_enabled banner_text
+    if ! have dpkg-query; then
+        result UNKNOWN 'dpkg-query unavailable; cannot determine whether GDM is installed'
+        return
+    fi
+    status="$(dpkg-query -W -f='${db:Status-Status}' gdm3 2>/dev/null)"
+    if [[ "$status" != installed ]]; then
+        result PASS 'gdm3 is not installed; GDM-specific login-screen controls are not applicable'
+        return
+    fi
+    config="$(grep -RhsE '^[[:space:]]*banner-message-(enable|text)[[:space:]]*=' /etc/dconf/db/gdm.d /etc/dconf/profile/gdm 2>/dev/null)"
+    banner_enabled="$(printf '%s\\n' "$config" | awk -F= '/banner-message-enable/ {gsub(/[[:space:]]/,"",$2); value=$2} END {print value}')"
+    banner_text="$(printf '%s\\n' "$config" | awk -F= '/banner-message-text/ {found=1} END {print found+0}')"
+    if [[ "$banner_enabled" == true && "$banner_text" == 1 ]]; then
+        result PASS 'gdm3 is installed and a GDM banner enable setting plus banner text were found; verify effective dconf policy'
+    else
+        result WARN "gdm3 is installed but a complete GDM login banner was not confirmed (enabled=${banner_enabled:-not-set}, text-found=$banner_text)"
+    fi
+}
+
+check_x_window_system() {
+    local installed=0 packages='' p status
+    if ! have dpkg-query; then
+        result UNKNOWN 'dpkg-query unavailable; cannot inventory X server packages'
+        return
+    fi
+    for p in xserver-xorg-core xserver-common xwayland; do
+        status="$(dpkg-query -W -f='${db:Status-Status}' "$p" 2>/dev/null)"
+        if [[ "$status" == installed ]]; then
+            installed=$((installed + 1))
+            packages+="${packages:+,}$p"
+        fi
+    done
+    if (( installed == 0 )); then
+        result PASS 'no checked X server/Xwayland packages are installed'
+    else
+        result INFO "$installed checked graphical server package(s) installed ($packages); confirm whether a graphical stack is required for this host role"
+    fi
+}
+
+check_avahi_autofs_services() {
+    local active=0 enabled=0 installed=0 unit state
+    for unit in avahi-daemon.service avahi-daemon.socket autofs.service; do
+        if is_active "$unit"; then active=$((active + 1)); fi
+        if have systemctl; then
+            state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+            [[ "$state" == enabled || "$state" == enabled-runtime ]] && enabled=$((enabled + 1))
+        fi
+    done
+    if have dpkg-query; then
+        for unit in avahi-daemon autofs; do
+            state="$(dpkg-query -W -f='${db:Status-Status}' "$unit" 2>/dev/null)"
+            [[ "$state" == installed ]] && installed=$((installed + 1))
+        done
+    fi
+    if (( active > 0 || enabled > 0 )); then
+        result WARN "Avahi/Autofs units active=$active enabled=$enabled; disable only if not required by the host role"
+    elif (( installed > 0 )); then
+        result INFO "$installed Avahi/Autofs package(s) installed but no checked unit is active or enabled"
+    else
+        result PASS 'no checked Avahi/Autofs package or active/enabled unit detected'
+    fi
+}
+
+check_journald_configuration() {
+    local config storage compress forward
+    if ! have systemd-analyze; then
+        result UNKNOWN 'systemd-analyze unavailable; cannot read effective journald configuration'
+        return
+    fi
+    config="$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null)" || {
+        result UNKNOWN 'unable to read effective journald configuration'
+        return
+    }
+    storage="$(awk -F= '/^[[:space:]]*Storage[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); v=tolower($2)} END {print v}' <<< "$config")"
+    compress="$(awk -F= '/^[[:space:]]*Compress[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); v=tolower($2)} END {print v}' <<< "$config")"
+    forward="$(awk -F= '/^[[:space:]]*ForwardToSyslog[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); v=tolower($2)} END {print v}' <<< "$config")"
+    if [[ "$storage" == persistent && "$compress" == yes ]]; then
+        result PASS "journald effective settings include Storage=persistent and Compress=yes (ForwardToSyslog=${forward:-default})"
+    elif [[ -z "$storage" && -z "$compress" ]]; then
+        result UNKNOWN 'Storage and Compress are not explicitly configured; systemd defaults may apply'
+    else
+        result WARN "journald settings require review (Storage=${storage:-default}, Compress=${compress:-default}, ForwardToSyslog=${forward:-default})"
+    fi
+}
+
+check_logrotate_configuration() {
+    local output
+    if ! have logrotate; then
+        result WARN 'logrotate command is not installed'
+        return
+    fi
+    if [[ ! -r /etc/logrotate.conf ]]; then
+        result UNKNOWN '/etc/logrotate.conf is missing or unreadable'
+        return
+    fi
+    output="$(logrotate -d /etc/logrotate.conf 2>&1)"
+    if [[ "$output" == *'error'* || "$output" == *'error:'* ]]; then
+        result WARN 'logrotate debug validation reported an error; inspect logrotate -d /etc/logrotate.conf output locally'
+    else
+        result PASS 'logrotate is installed and its configuration passed debug-mode parsing (no rotation was performed)'
+    fi
+}
+
+check_rsyslog_service() {
+    local installed=0 active=0 enabled='unknown'
+    if have dpkg-query; then
+        [[ "$(dpkg-query -W -f='${db:Status-Status}' rsyslog 2>/dev/null)" == installed ]] && installed=1
+    elif have rpm; then
+        rpm -q rsyslog >/dev/null 2>&1 && installed=1
+    else
+        have rsyslogd && installed=1
+    fi
+    is_active rsyslog.service && active=1
+    if have systemctl; then enabled="$(systemctl is-enabled rsyslog.service 2>/dev/null || true)"; fi
+    if (( active )); then
+        result PASS "rsyslog service is active (installed=$installed, enabled=$enabled)"
+    elif (( installed )); then
+        result WARN "rsyslog is installed but service is not active (enabled=$enabled)"
+    else
+        result WARN 'rsyslog package/service was not detected; verify whether journald alone satisfies the logging design'
+    fi
+}
+
+check_process_accounting() {
+    local installed=0 active=0 evidence=0 unit
+    for unit in acct.service psacct.service; do is_active "$unit" && active=1; done
+    if have dpkg-query; then
+        [[ "$(dpkg-query -W -f='${db:Status-Status}' acct 2>/dev/null)" == installed ]] && installed=1
+    elif have rpm; then
+        rpm -q psacct >/dev/null 2>&1 && installed=1
+    fi
+    have lastcomm && evidence=1
+    [[ -s /var/account/pacct || -s /var/log/account/pacct ]] && evidence=1
+    if (( active && evidence )); then
+        result PASS 'process accounting service and accounting evidence detected'
+    elif (( installed )); then
+        result WARN "process-accounting package is installed but active service/evidence was not confirmed (active=$active, evidence=$evidence)"
+    else
+        result WARN 'process accounting (acct/psacct) was not detected; enable only if required by the applicable benchmark/profile'
+    fi
+}
+
 # ---------- Test registry and resilient runner ----------
+
+# ---------- CIS Ubuntu 22.04 LTS Benchmark v3.0.0 additions ----------
+# These checks are read-only and deliberately return UNKNOWN when the required
+# local evidence is unavailable. They do not install packages or change settings.
+
+cis_sysctl_check() {
+    local key="$1" expected="$2" current
+    if ! have sysctl; then result UNKNOWN 'sysctl command unavailable'; return; fi
+    current="$(sysctl -n "$key" 2>/dev/null)" || { result UNKNOWN "cannot read $key"; return; }
+    if [[ "$current" == "$expected" ]]; then result PASS "$key=$current";
+    else result FAIL "$key=$current; expected $expected"; fi
+}
+
+cis_mount_option_check() {
+    local path="$1" option="$2" opts
+    if ! have findmnt; then result UNKNOWN 'findmnt command unavailable'; return; fi
+    opts="$(findmnt -n -o OPTIONS --target "$path" 2>/dev/null)" || { result UNKNOWN "cannot determine mount for $path"; return; }
+    case ",$opts," in *,"$option",*) result PASS "$path mount has $option";;
+        *) result FAIL "$path mount options do not include $option (actual: ${opts:-unknown})";; esac
+}
+
+cis_separate_mount_check() {
+    local path="$1" source root_source
+    if ! have findmnt; then result UNKNOWN 'findmnt command unavailable'; return; fi
+    source="$(findmnt -n -o SOURCE --target "$path" 2>/dev/null)" || { result UNKNOWN "cannot determine mount source for $path"; return; }
+    root_source="$(findmnt -n -o SOURCE --target / 2>/dev/null)" || { result UNKNOWN 'cannot determine root mount source'; return; }
+    if [[ "$source" != "$root_source" ]]; then result PASS "$path is on a mount source distinct from root ($source)";
+    else result FAIL "$path shares the root mount source ($root_source)"; fi
+}
+
+cis_module_disabled_check() {
+    local module="$1" conf loaded
+    if ! have modprobe; then result UNKNOWN 'modprobe unavailable'; return; fi
+    conf="$(modprobe -n -v "$module" 2>/dev/null | head -n 1)"
+    loaded="$(awk -v m="$module" '$1==m {print $1}' /proc/modules 2>/dev/null)"
+    if [[ "$conf" =~ install[[:space:]]+(/bin/false|/usr/bin/false|/bin/true|/usr/bin/true) ]] && [[ -z "$loaded" ]]; then
+        result PASS "$module is blocked by modprobe configuration and not loaded"
+    elif [[ -z "$conf" && -z "$loaded" ]]; then
+        result INFO "$module is not currently loaded; absence of a block rule was not established"
+    else
+        result FAIL "$module may be loadable or is loaded (modprobe=${conf:-no-rule}, loaded=${loaded:-no})"
+    fi
+}
+
+cis_service_not_in_use_check() {
+    local unit="$1" pkg="$2" active='inactive' installed='unknown'
+    if have systemctl && systemctl is-active --quiet "$unit" 2>/dev/null; then active='active'; fi
+    if have dpkg-query; then
+        if dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null | grep -qx installed; then installed='installed'; else installed='not-installed'; fi
+    fi
+    if [[ "$active" == active ]]; then result FAIL "$unit is active (package $pkg=$installed)";
+    elif [[ "$installed" == not-installed ]]; then result PASS "$unit is not active and $pkg is not installed";
+    elif [[ "$installed" == installed ]]; then result WARN "$pkg is installed but $unit is not active; verify it is disabled and not required";
+    else result UNKNOWN "cannot verify both service $unit and package $pkg"; fi
+}
+
+cis_file_mode_check() {
+    local path="$1" expected="$2" actual owner
+    [[ -e "$path" ]] || { result UNKNOWN "$path does not exist"; return; }
+    actual="$(stat -c '%a' "$path" 2>/dev/null)" || { result UNKNOWN "cannot stat $path"; return; }
+    owner="$(stat -c '%U:%G' "$path" 2>/dev/null)" || owner='unknown'
+    local actual_num expected_num
+    actual_num=$((8#$actual)); expected_num=$((8#$expected))
+    if (( actual_num <= expected_num )) && [[ "$owner" == root:root ]]; then result PASS "$path mode=$actual owner=$owner";
+    else result FAIL "$path mode=$actual owner=$owner; expected mode no more permissive than $expected and owner=root:root"; fi
+}
+
+cis_sshd_expect_check() {
+    local key="$1" expected="$2" actual
+    actual="$(sshd_value "$key" 2>/dev/null)"
+    if [[ -z "$actual" ]]; then result UNKNOWN "effective sshd setting $key unavailable";
+    elif [[ "$actual" == "$expected" ]]; then result PASS "effective $key=$actual";
+    else result FAIL "effective $key=$actual; expected $expected"; fi
+}
+
+check_cis_tmp_separate() { cis_separate_mount_check /tmp; }
+check_cis_tmp_nodev() { cis_mount_option_check /tmp nodev; }
+check_cis_tmp_nosuid() { cis_mount_option_check /tmp nosuid; }
+check_cis_tmp_noexec() { cis_mount_option_check /tmp noexec; }
+check_cis_shm_separate() { cis_separate_mount_check /dev/shm; }
+check_cis_shm_nodev() { cis_mount_option_check /dev/shm nodev; }
+check_cis_shm_nosuid() { cis_mount_option_check /dev/shm nosuid; }
+check_cis_shm_noexec() { cis_mount_option_check /dev/shm noexec; }
+check_cis_home_separate() { cis_separate_mount_check /home; }
+check_cis_var_separate() { cis_separate_mount_check /var; }
+check_cis_vartmp_separate() { cis_separate_mount_check /var/tmp; }
+check_cis_varlog_separate() { cis_separate_mount_check /var/log; }
+check_cis_audit_separate() { cis_separate_mount_check /var/log/audit; }
+check_cis_firewire_module() { cis_module_disabled_check firewire-core; }
+check_cis_overlay_module() { cis_module_disabled_check overlay; }
+check_cis_squashfs_module() { cis_module_disabled_check squashfs; }
+check_cis_udf_module() { cis_module_disabled_check udf; }
+check_cis_unused_fs_modules() {
+    local modules=(adfs affs befs bfs cramfs efs erofs exofs freevxfs f2fs hfs hfsplus jffs2 minix nilfs2 ntfs qnx4 qnx6 romfs sysv ubifs udf);
+    local m loaded=0 details=''
+    for m in "${modules[@]}"; do
+        if awk -v x="$m" '$1==x {found=1} END{exit !found}' /proc/modules 2>/dev/null; then loaded=$((loaded+1)); details+="$m,"; fi
+    done
+    if (( loaded == 0 )); then result INFO 'no listed uncommon filesystem modules are currently loaded; persistent block rules still require review';
+    else result WARN "uncommon filesystem modules currently loaded: ${details%,}"; fi
+}
+check_cis_apparmor_installed() {
+    if have dpkg-query && dpkg-query -W -f='${db:Status-Status}' apparmor 2>/dev/null | grep -qx installed; then result PASS 'AppArmor package is installed';
+    else result FAIL 'AppArmor package is not installed or cannot be verified'; fi
+}
+check_cis_apparmor_boot() {
+    local grub=''
+    [[ -r /etc/default/grub ]] && grub="$(grep -Eo 'apparmor=1|security=apparmor' /etc/default/grub 2>/dev/null | sort -u | tr '\n' ' ')"
+    if [[ "$grub" == *apparmor=1* && "$grub" == *security=apparmor* ]]; then result PASS 'GRUB configuration includes apparmor=1 and security=apparmor';
+    else result WARN "GRUB AppArmor boot parameters not both confirmed (found: ${grub:-none})"; fi
+}
+check_cis_ptrace_scope() { cis_sysctl_check kernel.yama.ptrace_scope 1; }
+check_cis_suid_dumpable() { cis_sysctl_check fs.suid_dumpable 0; }
+check_cis_core_pattern_limit() {
+    local v
+    if [[ -r /etc/security/limits.conf ]]; then v="$(grep -Ehv '^[[:space:]]*#|^[[:space:]]*$' /etc/security/limits.conf /etc/security/limits.d/*.conf 2>/dev/null | grep -E '^[*[:space:]]+hard[[:space:]]+core[[:space:]]+0([[:space:]]|$)' | wc -l)";
+    else result UNKNOWN 'limits configuration is unavailable'; return; fi
+    if (( v > 0 )); then result PASS 'hard core limit 0 directive detected'; else result WARN 'hard core limit 0 directive not detected; verify systemd-coredump and PAM limits'; fi
+}
+check_cis_prelink_absent() {
+    if have dpkg-query && dpkg-query -W -f='${db:Status-Status}' prelink 2>/dev/null | grep -qx installed; then result FAIL 'prelink package is installed';
+    elif have dpkg-query; then result PASS 'prelink package is not installed'; else result UNKNOWN 'dpkg-query unavailable'; fi
+}
+check_cis_apport_disabled() {
+    local state='unknown'
+    [[ -r /etc/default/apport ]] && state="$(awk -F= '$1=="enabled" {gsub(/[[:space:]]/,"",$2); print $2}' /etc/default/apport | tail -n1)"
+    if [[ "$state" == 0 ]]; then result PASS 'Apport enabled=0';
+    elif [[ "$state" == 1 ]]; then result WARN 'Apport enabled=1';
+    else result UNKNOWN 'Apport configuration not found or unrecognized'; fi
+}
+check_cis_issue_banner() {
+    local p="$1"; local text
+    [[ -r "$p" ]] || { result UNKNOWN "$p is unavailable"; return; }
+    text="$(tr -d '\r\n[:space:]' < "$p" 2>/dev/null)"
+    if [[ -n "$text" ]] && ! grep -Eqi '\\[lmnrosv]|(^|[[:space:]])(Ubuntu|Linux)[[:space:]]+[0-9]' "$p"; then result PASS "$p contains a non-empty banner without obvious OS-identifying tokens";
+    elif [[ -z "$text" ]]; then result FAIL "$p is empty";
+    else result WARN "$p may disclose system information or contain an unreviewed banner"; fi
+}
+check_cis_motd_banner() { check_cis_issue_banner /etc/motd; }
+check_cis_issue_banner_file() { check_cis_issue_banner /etc/issue; }
+check_cis_issue_net_banner() { check_cis_issue_banner /etc/issue.net; }
+check_cis_gdm_disable_user_list() {
+    local v
+    v="$(gsettings get org.gnome.login-screen disable-user-list 2>/dev/null)"
+    if [[ "$v" == true ]]; then result PASS 'GDM disable-user-list=true';
+    elif [[ "$v" == false ]]; then result FAIL 'GDM disable-user-list=false';
+    else result UNKNOWN 'GDM login-screen setting unavailable (GDM may not be installed)'; fi
+}
+check_cis_autofs_absent() { cis_service_not_in_use_check autofs.service autofs; }
+check_cis_dhcp_absent() { cis_service_not_in_use_check isc-dhcp-server.service isc-dhcp-server; }
+check_cis_dns_absent() { cis_service_not_in_use_check bind9.service bind9; }
+check_cis_dnsmasq_absent() { cis_service_not_in_use_check dnsmasq.service dnsmasq; }
+check_cis_ldap_absent() { cis_service_not_in_use_check slapd.service slapd; }
+check_cis_dovecot_absent() { cis_service_not_in_use_check dovecot.service dovecot-core; }
+check_cis_nfs_absent() { cis_service_not_in_use_check nfs-server.service nfs-kernel-server; }
+check_cis_nis_absent() { cis_service_not_in_use_check ypserv.service nis; }
+check_cis_cups_absent() { cis_service_not_in_use_check cups.service cups; }
+check_cis_rpcbind_absent() { cis_service_not_in_use_check rpcbind.service rpcbind; }
+check_cis_bluetooth_absent() { cis_service_not_in_use_check bluetooth.service bluez; }
+check_cis_wireless_interfaces() {
+    local n
+    if ! have ip; then result UNKNOWN 'ip command unavailable'; return; fi
+    n="$(ip -o link show 2>/dev/null | grep -Eic 'wl[a-zA-Z0-9_-]*:')"
+    if (( n == 0 )); then result PASS 'no wireless network interfaces detected'; else result WARN "$n wireless interface(s) detected; verify server requirement"; fi
+}
+check_cis_dccp_module() { cis_module_disabled_check dccp; }
+check_cis_tipc_module() { cis_module_disabled_check tipc; }
+check_cis_rds_module() { cis_module_disabled_check rds; }
+check_cis_sctp_module() { cis_module_disabled_check sctp; }
+check_cis_ipv4_forward() { cis_sysctl_check net.ipv4.ip_forward 0; }
+check_cis_ipv4_send_redirects_all() { cis_sysctl_check net.ipv4.conf.all.send_redirects 0; }
+check_cis_ipv4_send_redirects_default() { cis_sysctl_check net.ipv4.conf.default.send_redirects 0; }
+check_cis_ipv4_accept_redirects_all() { cis_sysctl_check net.ipv4.conf.all.accept_redirects 0; }
+check_cis_ipv4_accept_redirects_default() { cis_sysctl_check net.ipv4.conf.default.accept_redirects 0; }
+check_cis_ipv4_secure_redirects_all() { cis_sysctl_check net.ipv4.conf.all.secure_redirects 0; }
+check_cis_ipv4_secure_redirects_default() { cis_sysctl_check net.ipv4.conf.default.secure_redirects 0; }
+check_cis_ipv4_rp_filter_all() { cis_sysctl_check net.ipv4.conf.all.rp_filter 1; }
+check_cis_ipv4_rp_filter_default() { cis_sysctl_check net.ipv4.conf.default.rp_filter 1; }
+check_cis_ipv4_source_route_all() { cis_sysctl_check net.ipv4.conf.all.accept_source_route 0; }
+check_cis_ipv4_source_route_default() { cis_sysctl_check net.ipv4.conf.default.accept_source_route 0; }
+check_cis_ipv4_log_martians_all() { cis_sysctl_check net.ipv4.conf.all.log_martians 1; }
+check_cis_ipv4_log_martians_default() { cis_sysctl_check net.ipv4.conf.default.log_martians 1; }
+check_cis_ipv4_syncookies() { cis_sysctl_check net.ipv4.tcp_syncookies 1; }
+check_cis_sudo_use_pty() {
+    if grep -RhsE '^[[:space:]]*Defaults[[:space:]]+([^#]*,)?use_pty([[:space:],]|$)' /etc/sudoers /etc/sudoers.d 2>/dev/null | grep -q .; then result PASS 'sudo use_pty Defaults directive detected';
+    else result WARN 'sudo use_pty Defaults directive not detected'; fi
+}
+check_cis_sudo_logfile() {
+    if grep -RhsE '^[[:space:]]*Defaults[[:space:]]+.*logfile=' /etc/sudoers /etc/sudoers.d 2>/dev/null | grep -q .; then result PASS 'sudo logfile Defaults directive detected';
+    else result WARN 'sudo logfile Defaults directive not detected'; fi
+}
+check_cis_sshd_permit_empty() { cis_sshd_expect_check permitemptypasswords no; }
+check_cis_sshd_usepam() { cis_sshd_expect_check usepam yes; }
+check_cis_sshd_gssapi() { cis_sshd_expect_check gssapiauthentication no; }
+check_cis_sshd_hostbased() { cis_sshd_expect_check hostbasedauthentication no; }
+check_cis_sshd_ignore_rhosts() { cis_sshd_expect_check ignorerhosts yes; }
+check_cis_sshd_disable_forwarding() { cis_sshd_expect_check disableforwarding yes; }
+check_cis_sshd_maxstartups() {
+    local v; v="$(sshd_value maxstartups 2>/dev/null)"
+    if [[ -z "$v" ]]; then result UNKNOWN 'effective MaxStartups unavailable';
+    elif [[ "$v" == 10:30:60 || "$v" =~ ^[0-9]+(:[0-9]+:[0-9]+)?$ ]]; then result INFO "effective MaxStartups=$v; validate against approved benchmark value";
+    else result WARN "unrecognized MaxStartups=$v"; fi
+}
+check_cis_sshd_clientalive() {
+    local i c; i="$(sshd_value clientaliveinterval 2>/dev/null)"; c="$(sshd_value clientalivecountmax 2>/dev/null)"
+    if [[ "$i" =~ ^[0-9]+$ && "$c" =~ ^[0-9]+$ ]] && (( i > 0 && i <= 300 && c <= 3 )); then result PASS "ClientAliveInterval=$i ClientAliveCountMax=$c";
+    else result WARN "ClientAliveInterval=${i:-unset} ClientAliveCountMax=${c:-unset}; review SSH idle-session policy"; fi
+}
+check_cis_su_restricted() {
+    if grep -RhsE '^[[:space:]]*auth[[:space:]].*pam_wheel\.so' /etc/pam.d/su 2>/dev/null | grep -q .; then result PASS 'pam_wheel restriction detected for su';
+    else result WARN 'pam_wheel restriction for su not detected'; fi
+}
+check_cis_cron_yearly() { cis_file_mode_check /etc/cron.yearly 700; }
+check_cis_cron_d() { cis_file_mode_check /etc/cron.d 700; }
+check_cis_crontab() { cis_file_mode_check /etc/crontab 600; }
+check_cis_cron_allow() {
+    if [[ -f /etc/cron.allow ]]; then cis_file_mode_check /etc/cron.allow 600;
+    elif [[ -f /etc/cron.deny ]]; then result WARN '/etc/cron.allow is absent while /etc/cron.deny exists';
+    else result WARN 'neither /etc/cron.allow nor /etc/cron.deny exists'; fi
+}
+
+
+
+manual_review_required() {
+    local instruction="$1"
+    result INFO "MANUAL REVIEW REQUIRED: $instruction"
+}
+check_cis_gpg_keys_manual() { manual_review_required 'verify repository signing keys, trust, rotation, and provenance against the approved Ubuntu repository policy'; }
+check_cis_repositories_manual() { manual_review_required 'review enabled APT repositories, origins, suites, components, and third-party repository approval'; }
+check_cis_patching_manual() { manual_review_required 'verify patch policy, maintenance windows, security update coverage, and outstanding security advisories'; }
+check_cis_ipv6_status_manual() { manual_review_required 'identify whether IPv6 is required; document the approved state and validate related firewall/kernel settings'; }
+check_cis_ufw_outbound_manual() { manual_review_required 'review outbound UFW rules against the server role and approved egress policy'; }
+check_cis_iptables_flush_manual() { manual_review_required 'verify legacy iptables rules are flushed or intentionally managed when nftables is the selected firewall'; }
+check_cis_nftables_egress_manual() { manual_review_required 'review nftables outbound and established-connection rules against the approved network policy'; }
+check_cis_iptables_egress_manual() { manual_review_required 'review IPv4 iptables outbound and established-connection rules'; }
+check_cis_ip6tables_egress_manual() { manual_review_required 'review IPv6 ip6tables outbound and established-connection rules'; }
+check_cis_password_complexity_manual() { manual_review_required 'verify password complexity policy meets organizational requirements and the benchmark parameters'; }
+check_cis_min_password_age_manual() { manual_review_required 'review minimum password age for all existing accounts and account-management sources'; }
+check_cis_journal_upload_auth_manual() { manual_review_required 'verify systemd-journal-upload TLS certificates, private-key protection, and trusted server configuration'; }
+check_cis_audit_runtime_disk_manual() { manual_review_required 'compare loaded audit rules with on-disk rules and confirm they are identical after the required reload'; }
+
 TEST_NAMES=(
     'SSH Root Login Disabled'
     'SSH Password Authentication'
@@ -1338,6 +1896,14 @@ TEST_NAMES=(
     'USB Storage Restrictions'
     'Disk Encryption'
     'Package Integrity'
+    'Legal Login Banners'
+    'GDM Login Banner Configuration'
+    'X Window System Package Inventory'
+    'Avahi and Autofs Service Exposure'
+    'systemd-journald Configuration'
+    'logrotate Configuration'
+    'rsyslog Service Status'
+    'Process Accounting'
 )
 
 TEST_CIS_IDS=(
@@ -1351,53 +1917,61 @@ TEST_CIS_IDS=(
     '5.3.3.1.1-5.3.3.1.3'
     'none'
     '5.1.4'
-    '2.1.22'
+    'none'
     '2.2.4'
     '2.1.6'
     '2.1.14'
     '2.1.15'
-    '4.1.1, 4.2.x, 4.3.x, 4.4.x'
+    '4.1.1-4.1.7, 4.2.1-4.2.10, 4.3.x'
     'none'
     'none'
     '1.3.1.3'
     '1.2.2.1'
     '1.4.1'
-    '7.1.1-7.1.8'
+    '7.1.1-7.1.10'
     '7.1.13'
     '7.1.11'
-    '2.4.1.8, 2.4.2.1'
+    '2.4.1.2-2.4.1.9, 2.4.2.1'
     'none'
     'none'
-    '5.4.2.7'
     'none'
-    '2.1.22'
+    'none'
+    'none'
     '2.4.1.x'
     'none'
-    '6.3.1, 6.3.2'
-    '6.1.1.1'
-    'none'
-    '6.1.2.1.1-6.1.2.1.3'
-    '5.2.3'
+    '6.3.1-6.3.2'
     'none'
     'none'
+    '6.1.2.6'
+    '6.2.3.1'
     'none'
-    '3.3.2, 3.3.5, 3.3.8, 3.3.10'
-    '1.1.2.1.x, 1.1.2.2.x, 1.1.2.5.x'
-    '6.2.1.x, 6.2.2.x, 6.2.3.x'
+    'none'
+    'none'
+    '3.3.1.4-3.3.1.5, 3.3.1.8-3.3.1.9, 3.3.1.14-3.3.1.15, 3.3.1.18'
+    '1.1.2.1.2-1.1.2.1.3, 1.1.2.2.2-1.1.2.2.3, 1.1.2.5.2-1.1.2.5.3'
+    '6.2.1.1-6.2.1.4, 6.2.2.1-6.2.2.4'
     '5.3.3.2.1-5.3.3.2.8'
     '5.3.3.3.1-5.3.3.3.3'
     '5.3.3.4.3, 5.4.1.4'
     '5.4.1.5'
     '5.4.2.6, 5.4.3.3'
     '2.3.1.1, 2.3.2.x, 2.3.3.x'
-    '5.1.6, 5.1.15'
-    '1.1.1.1-1.1.1.5'
+    '5.1.6, 5.1.12, 5.1.15'
+    '1.1.1.1-1.1.1.11, 3.2.1-3.2.4'
     '1.5.1'
-    '1.5.3'
+    '1.5.3-1.5.4'
     '1.5.2'
-    '3.3.11'
+    '3.3.2.3-3.3.2.6'
     '1.1.1.9'
     'none'
+    'none'
+    'none'
+    'none'
+    'none'
+    'none'
+    '6.1.1.1.4-6.1.1.1.6'
+    '6.1.2.8'
+    '6.1.2.1-6.1.2.7'
     'none'
 )
 
@@ -1460,9 +2034,139 @@ TEST_FUNCTIONS=(
     check_usb_storage_restrictions
     check_disk_encryption
     check_package_integrity
+    check_legal_login_banners
+    check_gdm_configuration
+    check_x_window_system
+    check_avahi_autofs_services
+    check_journald_configuration
+    check_logrotate_configuration
+    check_rsyslog_service
+    check_process_accounting
+)
+
+
+# CIS v3.0.0 additions (kept separate from custom checks)
+TEST_NAMES+=(
+    'CIS /tmp Separate Mount' 'CIS /tmp nodev' 'CIS /tmp nosuid' 'CIS /tmp noexec'
+    'CIS /dev/shm Separate Mount' 'CIS /dev/shm nodev' 'CIS /dev/shm nosuid' 'CIS /dev/shm noexec'
+    'CIS /home Separate Mount' 'CIS /var Separate Mount' 'CIS /var/tmp Separate Mount'
+    'CIS /var/log Separate Mount' 'CIS /var/log/audit Separate Mount'
+    'CIS Firewire Module' 'CIS Overlay Module' 'CIS Squashfs Module' 'CIS UDF Module' 'CIS Unused Filesystem Modules'
+    'CIS AppArmor Package' 'CIS AppArmor Boot Configuration' 'CIS ptrace_scope' 'CIS suid_dumpable'
+    'CIS Core File Size Limit' 'CIS Prelink Absent' 'CIS Automatic Error Reporting'
+    'CIS /etc/motd Banner' 'CIS /etc/issue Banner' 'CIS /etc/issue.net Banner' 'CIS GDM Disable User List'
+    'CIS autofs Service' 'CIS DHCP Server Service' 'CIS DNS Server Service' 'CIS dnsmasq Service'
+    'CIS LDAP Server Service' 'CIS Dovecot Service' 'CIS NFS Service' 'CIS NIS Service' 'CIS CUPS Service'
+    'CIS rpcbind Service' 'CIS Bluetooth Service' 'CIS Wireless Interfaces'
+    'CIS dccp Module' 'CIS tipc Module' 'CIS rds Module' 'CIS sctp Module'
+    'CIS IPv4 Forwarding' 'CIS IPv4 Send Redirects All' 'CIS IPv4 Send Redirects Default'
+    'CIS IPv4 Accept Redirects All' 'CIS IPv4 Accept Redirects Default'
+    'CIS IPv4 Secure Redirects All' 'CIS IPv4 Secure Redirects Default'
+    'CIS IPv4 rp_filter All' 'CIS IPv4 rp_filter Default'
+    'CIS IPv4 Source Route All' 'CIS IPv4 Source Route Default'
+    'CIS IPv4 Log Martians All' 'CIS IPv4 Log Martians Default' 'CIS IPv4 TCP Syncookies'
+    'CIS sudo use_pty' 'CIS sudo logfile' 'CIS SSH PermitEmptyPasswords' 'CIS SSH UsePAM'
+    'CIS SSH GSSAPIAuthentication' 'CIS SSH HostbasedAuthentication' 'CIS SSH IgnoreRhosts'
+    'CIS SSH DisableForwarding' 'CIS SSH MaxStartups' 'CIS SSH ClientAlive Settings'
+    'CIS su Command Restriction' 'CIS cron.yearly Permissions' 'CIS cron.d Permissions'
+    'CIS crontab Permissions' 'CIS cron.allow Restriction'
+)
+TEST_CIS_IDS+=(
+    '1.1.2.1.1' '1.1.2.1.2' '1.1.2.1.3' '1.1.2.1.4'
+    '1.1.2.2.1' '1.1.2.2.2' '1.1.2.2.3' '1.1.2.2.4'
+    '1.1.2.3.1' '1.1.2.4.1' '1.1.2.5.1' '1.1.2.6.1' '1.1.2.7.1'
+    '1.1.1.11' '1.1.1.6' '1.1.1.7' '1.1.1.8' '1.1.1.10'
+    '1.3.1.1' '1.3.1.2' '1.5.2' '1.5.3' '1.5.4' '1.5.5' '1.5.6'
+    '1.6.1' '1.6.2' '1.6.3' '1.7.3'
+    '2.1.1' '2.1.3' '2.1.4' '2.1.5' '2.1.7' '2.1.8' '2.1.9' '2.1.10' '2.1.11' '2.1.12' '3.1.3' '3.1.2'
+    '3.2.1' '3.2.2' '3.2.3' '3.2.4'
+    '3.3.1.1' '3.3.1.4' '3.3.1.5' '3.3.1.8' '3.3.1.9' '3.3.1.10' '3.3.1.11'
+    '3.3.1.12' '3.3.1.13' '3.3.1.14' '3.3.1.15' '3.3.1.16' '3.3.1.17' '3.3.1.18'
+    '5.2.2' '5.2.3' '5.1.19' '5.1.22' '5.1.9' '5.1.10' '5.1.11' '5.1.8' '5.1.18' '5.1.7'
+    '5.2.7' '2.4.1.7' '2.4.1.8' '2.4.1.2' '2.4.1.9'
+)
+TEST_FUNCTIONS+=(
+    check_cis_tmp_separate check_cis_tmp_nodev check_cis_tmp_nosuid check_cis_tmp_noexec
+    check_cis_shm_separate check_cis_shm_nodev check_cis_shm_nosuid check_cis_shm_noexec
+    check_cis_home_separate check_cis_var_separate check_cis_vartmp_separate check_cis_varlog_separate check_cis_audit_separate
+    check_cis_firewire_module check_cis_overlay_module check_cis_squashfs_module check_cis_udf_module check_cis_unused_fs_modules
+    check_cis_apparmor_installed check_cis_apparmor_boot check_cis_ptrace_scope check_cis_suid_dumpable
+    check_cis_core_pattern_limit check_cis_prelink_absent check_cis_apport_disabled
+    check_cis_motd_banner check_cis_issue_banner_file check_cis_issue_net_banner check_cis_gdm_disable_user_list
+    check_cis_autofs_absent check_cis_dhcp_absent check_cis_dns_absent check_cis_dnsmasq_absent
+    check_cis_ldap_absent check_cis_dovecot_absent check_cis_nfs_absent check_cis_nis_absent check_cis_cups_absent
+    check_cis_rpcbind_absent check_cis_bluetooth_absent check_cis_wireless_interfaces
+    check_cis_dccp_module check_cis_tipc_module check_cis_rds_module check_cis_sctp_module
+    check_cis_ipv4_forward check_cis_ipv4_send_redirects_all check_cis_ipv4_send_redirects_default
+    check_cis_ipv4_accept_redirects_all check_cis_ipv4_accept_redirects_default
+    check_cis_ipv4_secure_redirects_all check_cis_ipv4_secure_redirects_default
+    check_cis_ipv4_rp_filter_all check_cis_ipv4_rp_filter_default
+    check_cis_ipv4_source_route_all check_cis_ipv4_source_route_default
+    check_cis_ipv4_log_martians_all check_cis_ipv4_log_martians_default check_cis_ipv4_syncookies
+    check_cis_sudo_use_pty check_cis_sudo_logfile check_cis_sshd_permit_empty check_cis_sshd_usepam
+    check_cis_sshd_gssapi check_cis_sshd_hostbased check_cis_sshd_ignore_rhosts check_cis_sshd_disable_forwarding
+    check_cis_sshd_maxstartups check_cis_sshd_clientalive check_cis_su_restricted
+    check_cis_cron_yearly check_cis_cron_d check_cis_crontab check_cis_cron_allow
+)
+
+
+TEST_NAMES+=(
+    'CIS GPG Repository Keys Manual Review' 'CIS APT Repositories Manual Review'
+    'CIS Patching Policy Manual Review' 'CIS IPv6 Status Manual Review'
+    'CIS UFW Outbound Rules Manual Review' 'CIS iptables Flush Manual Review'
+    'CIS nftables Egress Rules Manual Review' 'CIS iptables Egress Rules Manual Review'
+    'CIS ip6tables Egress Rules Manual Review' 'CIS Password Complexity Manual Review'
+    'CIS Minimum Password Age Manual Review' 'CIS Journal Upload TLS Manual Review'
+    'CIS Audit Runtime/On-Disk Rules Manual Review'
+)
+TEST_CIS_IDS+=(
+    '1.2.1.1' '1.2.1.2' '1.2.2.1' '3.1.1' '4.1.5' '4.2.3'
+    '4.2.7' '4.3.2.3' '4.3.3.3' '5.3.3.2.3' '5.4.1.2'
+    '6.1.1.2.2' '6.2.3.21'
+)
+TEST_FUNCTIONS+=(
+    check_cis_gpg_keys_manual check_cis_repositories_manual check_cis_patching_manual check_cis_ipv6_status_manual
+    check_cis_ufw_outbound_manual check_cis_iptables_flush_manual check_cis_nftables_egress_manual
+    check_cis_iptables_egress_manual check_cis_ip6tables_egress_manual check_cis_password_complexity_manual
+    check_cis_min_password_age_manual check_cis_journal_upload_auth_manual check_cis_audit_runtime_disk_manual
+)
+
+
+# CIS profile level metadata, aligned with TEST_NAMES / TEST_CIS_IDS / TEST_FUNCTIONS.
+TEST_CIS_LEVELS=(
+    '1' 'none' '1' 'none' '1' '2' '1' '2'
+    'none' '1' 'none' '1' '1' '1' '1' '2'
+    'none' 'none' '1' '1' '1' '1' '1' '1'
+    '1' 'none' 'none' 'none' 'none' 'none' '1' 'none'
+    '1' 'none' 'none' '1' '2' 'none' 'none' 'none'
+    '1' '1' '2' '1' '1' '1' '1' '1'
+    '1' '1' '2' '1' '1' '1' '1' '1'
+    'none' 'none' 'none' 'none' 'none' 'none' '1' '1'
+    '1' 'none' '1' '1' '1' '1' '1' '1'
+    '1' '1' '2' '2' '2' '2' '2' '1'
+    '2' '2' '2' '1' '1' '1' '1' '1'
+    '1' '1' '1' '1' '1' '1' '1' '1'
+    '1' '1' '1' '1' '1' '1' '1' '1'
+    '1' '1' '1' '1' '1' '1' '1' '2'
+    '1' '1' '1' '1' '1' '1' '1' '1'
+    '1' '1' '1' '1' '1' '1' '1' '1'
+    '1' '2' '1' '1' '2' '1' '1' '1'
+    '1' '1' '1' '1' '1' '1' '1' '1'
+    '1' '1' '1' '1' '1' '1' '2' '1'
+    '2'
 )
 
 TOTAL_TESTS="${#TEST_FUNCTIONS[@]}"
+
+# Align the CIS metadata column across all test names.
+NAME_FIELD_WIDTH=0
+for test_name in "${TEST_NAMES[@]}"; do
+    test_name="${test_name#CIS }"
+    test_name_length=${#test_name}
+    test_name_length=$((test_name_length + 4)) # '- [' + ']'
+    (( test_name_length > NAME_FIELD_WIDTH )) && NAME_FIELD_WIDTH=$test_name_length
+done
+
 INDEX=0
 PASS_COUNT=0
 WARN_COUNT=0
@@ -1470,6 +2174,12 @@ FAIL_COUNT=0
 INFO_COUNT=0
 UNKNOWN_COUNT=0
 ERROR_COUNT=0
+RESULT_NAMES=()
+RESULT_CATEGORIES=()
+RESULT_CIS_IDS=()
+RESULT_CIS_LEVELS=()
+RESULT_STATUSES=()
+RESULT_DETAILS=()
 
 HOST_NAME="$(hostname -f 2>/dev/null || hostname 2>/dev/null || printf 'unknown')"
 DISTRO_NAME="$(awk -F= '$1=="PRETTY_NAME" {gsub(/^"|"$/, "", $2); print $2; exit}' /etc/os-release 2>/dev/null)"
@@ -1477,25 +2187,62 @@ DISTRO_NAME="$(awk -F= '$1=="PRETTY_NAME" {gsub(/^"|"$/, "", $2); print $2; exit
 RUN_TIME="$(date -Is 2>/dev/null || date '+%Y-%m-%d %H:%M:%S %z')"
 
 show_banner
-log_line '======================================================================'
-log_line 'Nasaru LINUX SERVER HARDENING AUDIT By M0G3H'
-log_line "Timestamp : $RUN_TIME"
-log_line "Hostname  : $HOST_NAME"
-log_line "OS        : $DISTRO_NAME"
-log_line "Kernel    : $(uname -r 2>/dev/null || printf 'unknown')"
-log_line "Run as    : $([[ "$(id -u 2>/dev/null)" == 0 ]] && printf 'root' || printf 'non-root')"
-log_line "Report    : $REPORT_FILE"
-log_line 'Mode      : READ-ONLY (no configuration changes, no network scan)'
-log_line 'Scope     : Linux only; Auditd/Windows Security Auditing test intentionally excluded'
-log_line '----------------------------------------------------------------------'
+log_header_line '======================================================================'
+log_header_line "Nazaru LINUX SERVER HARDENING AUDIT v$VERSION By M0G3H"
+log_header_line "Timestamp : $RUN_TIME"
+log_header_line "Hostname  : $HOST_NAME"
+log_header_line "OS        : $DISTRO_NAME"
+OS_ID="$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-unknown}")"
+if [[ "$OS_ID" != ubuntu ]]; then
+    OS_WARNING="WARNING   : This operating system is not Ubuntu (detected ID=${OS_ID}); Ubuntu 22.04 CIS benchmark results may not apply."
+    log_alert "$OS_WARNING"
+fi
+log_header_line "Kernel    : $(uname -r 2>/dev/null || printf 'unknown')"
+log_header_line "Run as    : $([[ "$(id -u 2>/dev/null)" == 0 ]] && printf 'root' || printf 'non-root')"
+log_header_line "Report    : $REPORT_FILE"
+log_header_line 'Mode      : READ-ONLY (no configuration changes, no network scan)'
+log_header_line 'Scope     : Local read-only checks; CIS baseline: Ubuntu 22.04 LTS v3.0.0 Level 1 + Level 2 Server'
+log_header_line 'Network   : No network scans or outbound connections are initiated by Nazaru'
+log_header_line '----------------------------------------------------------------------'
+
+test_category() {
+    local fn="$1" name="$2"
+    case "$fn" in
+        check_ssh_*|check_root_account|check_uid0_accounts|check_empty_passwords|check_sudo_*|check_password_*|check_pam_lockout|check_mfa_config|check_ssh_access_restrictions|check_account_inactivity|check_default_umask|check_authorized_keys|check_admin_groups|check_user_account_inventory|check_cis_sshd_*|check_cis_sudo_*|check_cis_su_restricted|check_cis_cron_allow|check_cron_access)
+            printf '%s' 'Authentication & Account Security' ;;
+        check_listening_sockets|check_telnet_service|check_ftp_service|check_samba_smb|check_snmpv3|check_firewall|check_ipv6_security|check_cis_autofs_absent|check_cis_dhcp_absent|check_cis_dns_absent|check_cis_dnsmasq_absent|check_cis_ldap_absent|check_cis_dovecot_absent|check_cis_nfs_absent|check_cis_nis_absent|check_cis_cups_absent|check_cis_rpcbind_absent|check_cis_bluetooth_absent|check_cis_wireless_interfaces|check_cis_ipv4_*|check_cis_dccp_module|check_cis_tipc_module|check_cis_rds_module|check_cis_sctp_module|check_cis_ipv6_status_manual|check_cis_ufw_outbound_manual|check_cis_iptables_*|check_cis_ip6tables_*|check_cis_nftables_egress_manual|check_cis_sshd_*|check_ssh_cryptographic_settings)
+            printf '%s' 'Network & Service Security' ;;
+        check_critical_file_permissions|check_suid_sgid|check_world_writable_files|check_filesystem_mount_options|check_cis_tmp_*|check_cis_shm_*|check_cis_home_separate|check_cis_var_separate|check_cis_vartmp_separate|check_cis_varlog_separate|check_cis_audit_separate|check_cis_cron_yearly|check_cis_cron_d|check_cis_crontab)
+            printf '%s' 'Filesystem & Permissions' ;;
+        check_secure_boot|check_mac_framework|check_grub_password|check_kernel_security_parameters|check_kernel_module_restrictions|check_aslr_configuration|check_core_dump_restrictions|check_ptrace_restrictions|check_usb_storage_restrictions|check_cis_firewire_module|check_cis_overlay_module|check_cis_squashfs_module|check_cis_udf_module|check_cis_unused_fs_modules|check_cis_apparmor_*|check_cis_ptrace_scope|check_cis_suid_dumpable|check_cis_core_pattern_limit)
+            printf '%s' 'Kernel & Boot Security' ;;
+        check_file_integrity_monitoring|check_authentication_logs|check_edr_presence|check_remote_log_forwarding|check_privilege_change_logging|check_resource_monitoring|check_auditd_configuration|check_journald_configuration|check_rsyslog_service|check_process_accounting|check_cis_journal_upload_auth_manual|check_cis_audit_runtime_disk_manual)
+            printf '%s' 'Logging, Auditing & Monitoring' ;;
+        check_update_reboot_flag|check_automatic_updates|check_systemd_enabled_services|check_cron_persistence_inventory|check_legacy_startup|check_backup_immutability|check_restore_test_evidence|check_package_integrity|check_cis_prelink_absent|check_cis_apport_disabled|check_cis_gpg_keys_manual|check_cis_repositories_manual|check_cis_patching_manual)
+            printf '%s' 'System Integrity & Maintenance' ;;
+        check_cis_password_complexity_manual|check_cis_min_password_age_manual)
+            printf '%s' 'Authentication & Account Security' ;;
+        *)
+            printf '%s' 'System Configuration & Compliance' ;;
+    esac
+}
+
+xml_escape() {
+    local value="$1"
+    value=${value//&/\&amp;}
+    value=${value//</\&lt;}
+    value=${value//>/\&gt;}
+    value=${value//\"/\&quot;}
+    value=${value//\'/\&apos;}
+    printf '%s' "$value"
+}
 
 run_check() {
-    local name="$1" fn="$2" cis_id="$3" raw rc status detail
+    local name="$1" fn="$2" cis_id="$3" cis_level="$4" category="$5"
+    local raw rc status detail prefix status_tag color result_line
     INDEX=$((INDEX + 1))
 
-    # The function runs in a subshell. A command failure is captured here and
-    # cannot terminate the parent script or prevent subsequent tests.
-    raw="$("$fn" 2>&1)"
+    raw="$($fn 2>&1)"
     rc=$?
     if (( rc != 0 )); then
         status='ERROR'
@@ -1504,18 +2251,20 @@ run_check() {
         status="${raw%%|*}"
         detail="${raw#*|}"
         case "$status" in PASS|WARN|FAIL|INFO|UNKNOWN|ERROR) ;;
-            *) status='ERROR'; detail='test returned an invalid status format';;
+            *) status='ERROR'; detail='test returned an invalid status format' ;;
         esac
     else
         status='ERROR'
         detail='test returned no valid STATUS|DETAIL result'
     fi
 
-    # Keep every result on one line so a single malformed command cannot
-    # corrupt the report layout.
     detail="${detail//$'\n'/ }"
     detail="${detail//$'\r'/ }"
     detail="${detail//|/\/}"
+    if [[ "${detail,,}" == 'manual review required:'* ]]; then
+        detail="${detail#*:}"
+        detail="${detail# }"
+    fi
 
     case "$status" in
         PASS) PASS_COUNT=$((PASS_COUNT + 1));;
@@ -1525,30 +2274,102 @@ run_check() {
         UNKNOWN) UNKNOWN_COUNT=$((UNKNOWN_COUNT + 1));;
         ERROR) ERROR_COUNT=$((ERROR_COUNT + 1));;
     esac
-    local result_line color
-    result_line="[$(printf '%02d' "$INDEX")/$TOTAL_TESTS] [✓] $name | CIS-ID=\"$cis_id\" | STATUS=$status | $detail"
+
+    [[ "$cis_level" == none ]] && cis_level='N/A'
+    name="${name#CIS }"
+    printf -v name_field "%-*s" "$NAME_FIELD_WIDTH" "- [$name]"
+    prefix="${name_field} [CIS-Level=$cis_level] [CIS-ID=\"$cis_id\"] "
+    status_tag="[STATUS=$status]"
+    result_line="${prefix}${status_tag}"
+    if (( DESCRIPTION_MODE )); then
+        result_line+=" [$detail]"
+    fi
 
     case "$status" in
-        PASS)    color='\033[32m' ;;       # Green
-        WARN)    color='\033[31m' ;;       # Red, as requested
-        FAIL)    color='\033[1;31m' ;;     # Bold red
-        INFO)    color='\033[36m' ;;       # Cyan
-        UNKNOWN) color='\033[33m' ;;       # Yellow
-        ERROR)   color='\033[35m' ;;       # Magenta
+        PASS)    color='\033[32m' ;;
+        WARN)    color='\033[31m' ;;
+        FAIL)    color='\033[1;31m' ;;
+        INFO)    color='\033[36m' ;;
+        UNKNOWN) color='\033[33m' ;;
+        ERROR)   color='\033[35m' ;;
         *)       color='\033[0m' ;;
     esac
 
-    log_result "$result_line" "$color"
+    log_result "$result_line" "$prefix" "$status_tag" "$detail" "$color" "$status"
+    RESULT_NAMES+=("$name")
+    RESULT_CATEGORIES+=("$category")
+    RESULT_CIS_IDS+=("$cis_id")
+    RESULT_CIS_LEVELS+=("$cis_level")
+    RESULT_STATUSES+=("$status")
+    RESULT_DETAILS+=("$detail")
 }
 
-for i in "${!TEST_FUNCTIONS[@]}"; do
-    run_check "${TEST_NAMES[$i]}" "${TEST_FUNCTIONS[$i]}" "${TEST_CIS_IDS[$i]}"
+CATEGORIES=(
+    'Authentication & Account Security'
+    'Network & Service Security'
+    'Filesystem & Permissions'
+    'Kernel & Boot Security'
+    'Logging, Auditing & Monitoring'
+    'System Integrity & Maintenance'
+    'System Configuration & Compliance'
+)
+
+# Run checks grouped by category while retaining the source arrays as the single
+# source of truth for test names, functions, CIS IDs and profile levels.
+for category in "${CATEGORIES[@]}"; do
+    category_has_tests=0
+    for i in "${!TEST_FUNCTIONS[@]}"; do
+        current_category="$(test_category "${TEST_FUNCTIONS[$i]}" "${TEST_NAMES[$i]}")"
+        [[ "$current_category" == "$category" ]] && category_has_tests=1 && break
+    done
+    (( category_has_tests )) || continue
+    log_line "[+] $category"
+    log_line '-----------------------'
+    for i in "${!TEST_FUNCTIONS[@]}"; do
+        current_category="$(test_category "${TEST_FUNCTIONS[$i]}" "${TEST_NAMES[$i]}")"
+        [[ "$current_category" == "$category" ]] || continue
+        run_check "${TEST_NAMES[$i]}" "${TEST_FUNCTIONS[$i]}" "${TEST_CIS_IDS[$i]}" "${TEST_CIS_LEVELS[$i]}" "$category"
+    done
+    log_line ''
 done
 
 log_line '----------------------------------------------------------------------'
 log_line "SUMMARY | TOTAL=$TOTAL_TESTS | PASS=$PASS_COUNT | WARN=$WARN_COUNT | FAIL=$FAIL_COUNT | INFO=$INFO_COUNT | UNKNOWN=$UNKNOWN_COUNT | ERROR=$ERROR_COUNT"
 log_line 'END OF AUDIT'
 log_line '======================================================================'
+
+if (( XML_ENABLED )); then
+    {
+        printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+        printf '<nazaru-report version="%s">\n' "$(xml_escape "$VERSION")"
+        printf '  <metadata>\n'
+        printf '    <timestamp>%s</timestamp>\n' "$(xml_escape "$RUN_TIME")"
+        printf '    <hostname>%s</hostname>\n' "$(xml_escape "$HOST_NAME")"
+        printf '    <operating-system>%s</operating-system>\n' "$(xml_escape "$DISTRO_NAME")"
+        printf '    <os-id>%s</os-id>\n' "$(xml_escape "$OS_ID")"
+        printf '    <kernel>%s</kernel>\n' "$(xml_escape "$(uname -r 2>/dev/null || printf unknown)")"
+        printf '    <read-only>true</read-only>\n'
+        printf '  </metadata>\n'
+        if [[ "$OS_ID" != ubuntu ]]; then
+            printf '  <warning>%s</warning>\n' "$(xml_escape "$OS_WARNING")"
+        fi
+        printf '  <summary total="%s" pass="%s" warn="%s" fail="%s" info="%s" unknown="%s" error="%s" />\n' \
+            "$TOTAL_TESTS" "$PASS_COUNT" "$WARN_COUNT" "$FAIL_COUNT" "$INFO_COUNT" "$UNKNOWN_COUNT" "$ERROR_COUNT"
+        printf '  <results>\n'
+        for j in "${!RESULT_NAMES[@]}"; do
+            printf '    <test category="%s" name="%s" cis-level="%s" cis-id="%s" status="%s">%s</test>\n' \
+                "$(xml_escape "${RESULT_CATEGORIES[$j]}")" \
+                "$(xml_escape "${RESULT_NAMES[$j]}")" \
+                "$(xml_escape "${RESULT_CIS_LEVELS[$j]}")" \
+                "$(xml_escape "${RESULT_CIS_IDS[$j]}")" \
+                "$(xml_escape "${RESULT_STATUSES[$j]}")" \
+                "$(xml_escape "${RESULT_DETAILS[$j]}")"
+        done
+        printf '  </results>\n'
+        printf '</nazaru-report>\n'
+    } > "$XML_FILE" || { printf 'ERROR: failed writing XML report: %s\n' "$XML_FILE" >&2; exit 2; }
+    if (( ! QUIET_MODE )); then printf 'XML report saved: %s\n' "$XML_FILE"; fi
+fi
 
 # Return success if the audit completed. Findings are reported in the file;
 # they do not make the audit process itself fail.
