@@ -21,6 +21,14 @@ NAZARU does not automatically change system configurations, perform network scan
 
 ---
 
+## 🖥️ Project View
+
+<p align="center">
+  <img src="./project-visuall.png" alt="NAZARU — The Digital Guardian" width="100%">
+</p>
+
+---
+
 ## 👥 Who Is NAZARU For?
 
 | Audience | Purpose |
