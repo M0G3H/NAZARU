@@ -13,13 +13,11 @@ Inspired by these meanings, NAZARU represents the mission of the tool: to identi
 
 ## 📌 Project Description
 
-**NAZARU** is a Bash-based Linux security auditing tool that evaluates a system against a collection of 40 security and hardening checks.
+**NAZARU** is a local, read-only Linux security auditing tool. It performs **153 security checks** covering areas such as authentication, SSH, network services, file permissions, system services, logging, and system integrity.
 
-It examines important areas of Linux system security, including SSH configuration, user accounts, authentication policies, network services, firewall status, file permissions, system services, logging, and security monitoring.
+The checks are mapped to the **CIS Ubuntu Linux 22.04 LTS Benchmark v3.0.0 (Level 1 and Level 2 Server)**.
 
-NAZARU collects system information, evaluates security conditions, and classifies its findings using clear status levels to help administrators understand the security posture of their Linux systems.
-
-The tool is designed to run locally without requiring a centralized security platform or external service.
+NAZARU does not automatically change system configurations, perform network scans, or initiate outbound connections.
 
 ---
 
@@ -38,14 +36,17 @@ The tool is designed to run locally without requiring a centralized security pla
 
 ## ✨ Key Advantages
 
-- **🔍 40 Security Checks** — Evaluates 40 different areas of Linux system security.
+- **🔍 153 Security Checks** — Evaluates 40 different areas of Linux system security.
+- **📝 Test ID** - CIS Benchmark level and ID shown with test results.
 - **⚡ Lightweight** — Implemented in Bash without requiring a large application stack.
 - **🔒 Local Execution** — Performs assessments directly on the target Linux system.
 - **📊 Clear Results** — Uses structured security statuses to make findings easy to understand.
-- **📝 Report Generation** — Supports saving scan results to a report file.
+- **📝 Report Generation** — Text and XML report generation.
 - **🎨 Readable Output** — Uses colored terminal output and a custom command-line banner.
 - **🧩 Broad Coverage** — Examines authentication, SSH, network exposure, permissions, logging, monitoring, and more.
 - **🚫 Read-Only Assessment** — Designed to inspect system security without intentionally modifying system settings.
+- **📝 Modes** - Quiet mode and descriptions mode.
+
 
 ---
 
@@ -85,7 +86,7 @@ NAZARU uses six status levels to classify assessment results:
 
 ---
 
-## 🚀 How to Use
+## 🚀 How to install
 
 ### 1. Clone the Repository
 
@@ -140,11 +141,10 @@ Running with elevated privileges can improve visibility into protected files, sy
 ## ⚠️ Important Notes
 
 - NAZARU is intended for Linux systems.
-- Some checks depend on available system utilities and distribution-specific configuration files.
-- Running without root privileges may limit access to certain protected resources.
-- `UNKNOWN` means that a condition could not be reliably verified; it should not be interpreted as secure.
-- Always review findings before making system configuration changes.
-- Use NAZARU only in systems you own or are authorized to assess.
+- The CIS mapping is based on Ubuntu 22.04 LTS. When NAZARU runs on another distribution, it displays an OS warning and some benchmark results may not apply.
+- Running without root privileges may prevent access to some protected files and settings.
+- Review findings before making any system changes.
+- Use NAZARU only on systems you own or are authorized to assess.
 
 ---
 
